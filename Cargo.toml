@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "crates/*",
+    "crates/*", "scripts/rng-test",
 ]
 resolver = "2"
 

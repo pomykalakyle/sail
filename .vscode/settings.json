@@ -14,4 +14,7 @@
     "editor.defaultFormatter": "charliermarsh.ruff",
   },
   "flake8.enabled": false,
+  "[jsonc]": {
+    "editor.defaultFormatter": "vscode.json-language-features"
+  },
 }

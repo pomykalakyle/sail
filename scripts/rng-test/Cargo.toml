@@ -1,0 +1,10 @@
+[package]
+name = "rng-test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rand = "0.9"
+rand_chacha = "0.9"
+rand_xoshiro = "0.7"
+murmur3 = "0.5"

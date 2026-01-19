@@ -3,6 +3,11 @@
   "build": {
     "dockerfile": "Dockerfile"
   },
+  "workspaceMount": "source=sail-dev-volume,target=/workspaces/sail,type=volume",
+  "workspaceFolder": "/workspaces/sail",
+  "mounts": [
+    "source=spark-dev-volume,target=/workspaces/spark,type=volume"
+  ],
   "features": {
     "ghcr.io/devcontainers/features/node:1": {
       "version": "22"
@@ -16,7 +21,7 @@
       "profile": "default"
     }
   },
-  "postCreateCommand": "hatch env create default && . ${containerWorkspaceFolder}/.venvs/default/bin/activate && pip install --upgrade pip && echo 'source ${containerWorkspaceFolder}/.venvs/default/bin/activate' >> ~/.bashrc",
+  "postCreateCommand": "if [ ! -d /workspaces/spark/.git ]; then git clone --depth 1 https://github.com/apache/spark.git /workspaces/spark; fi && hatch env create default && . ${containerWorkspaceFolder}/.venvs/default/bin/activate && pip install --upgrade pip && echo 'source ${containerWorkspaceFolder}/.venvs/default/bin/activate' >> ~/.bashrc",
   "customizations": {
     "vscode": {
       "extensions": [

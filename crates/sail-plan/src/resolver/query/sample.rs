@@ -72,54 +72,84 @@ impl PlanResolver<'_> {
             .project(all_exprs)?
             .build()?;
 
-        if !with_replacement {
-            let plan: LogicalPlan = LogicalPlanBuilder::from(plan_with_rand)
-                .filter(col(&rand_column_name).lt(lit(upper_bound)))?
-                .filter(col(&rand_column_name).gt_eq(lit(lower_bound)))?
-                .build()?;
-            let plan: LogicalPlan = LogicalPlanBuilder::from(plan)
-                .project(init_exprs)?
-                .build()?;
-            Ok(plan)
+        if with_replacement {
+            Self::resolve_sample_with_replacement(
+                plan_with_rand,
+                &rand_column_name,
+                init_exprs,
+                state,
+            )
         } else {
-            let plan: LogicalPlan = plan_with_rand.clone();
-            let init_exprs_aux: Vec<Expr> = plan
-                .schema()
-                .columns()
-                .iter()
-                .map(|col| Expr::Column(col.clone()))
-                .collect();
-            let array_column_name: String = state.register_field_name("array_value");
-            let arr_expr: Expr = Expr::ScalarFunction(ScalarFunction {
-                func: Arc::new(ScalarUDF::from(SparkSequence::new())),
-                args: vec![
-                    Expr::Literal(ScalarValue::Int64(Some(1)), None),
-                    col(&rand_column_name),
-                ],
-            })
-            .alias(&array_column_name);
-            let plan: LogicalPlan = LogicalPlanBuilder::from(plan)
-                .project(
-                    init_exprs_aux
-                        .clone()
-                        .into_iter()
-                        .chain(vec![arr_expr])
-                        .map(Into::into)
-                        .collect::<Vec<SelectExpr>>(),
-                )?
-                .build()?;
-            let plan: LogicalPlan = LogicalPlanBuilder::from(plan)
-                .unnest_column(array_column_name.clone())?
-                .build()?;
-
-            Ok(LogicalPlanBuilder::from(plan)
-                .project(
-                    init_exprs
-                        .into_iter()
-                        .map(Into::into)
-                        .collect::<Vec<SelectExpr>>(),
-                )?
-                .build()?)
+            Self::resolve_sample_without_replacement(
+                plan_with_rand,
+                &rand_column_name,
+                lower_bound,
+                upper_bound,
+                init_exprs,
+            )
         }
+    }
+
+    /// Bernoulli sampling - filter rows where random value falls in [lower, upper)
+    fn resolve_sample_without_replacement(
+        plan_with_rand: LogicalPlan,
+        rand_column_name: &str,
+        lower_bound: f64,
+        upper_bound: f64,
+        init_exprs: Vec<Expr>,
+    ) -> PlanResult<LogicalPlan> {
+        let plan = LogicalPlanBuilder::from(plan_with_rand)
+            .filter(col(rand_column_name).lt(lit(upper_bound)))?
+            .filter(col(rand_column_name).gt_eq(lit(lower_bound)))?
+            .build()?;
+        let plan = LogicalPlanBuilder::from(plan)
+            .project(init_exprs)?
+            .build()?;
+        Ok(plan)
+    }
+
+    /// Poisson sampling - replicate rows based on Poisson distribution
+    fn resolve_sample_with_replacement(
+        plan_with_rand: LogicalPlan,
+        rand_column_name: &str,
+        init_exprs: Vec<Expr>,
+        state: &mut PlanResolverState,
+    ) -> PlanResult<LogicalPlan> {
+        let init_exprs_aux: Vec<Expr> = plan_with_rand
+            .schema()
+            .columns()
+            .iter()
+            .map(|col| Expr::Column(col.clone()))
+            .collect();
+        let array_column_name: String = state.register_field_name("array_value");
+        let arr_expr: Expr = Expr::ScalarFunction(ScalarFunction {
+            func: Arc::new(ScalarUDF::from(SparkSequence::new())),
+            args: vec![
+                Expr::Literal(ScalarValue::Int64(Some(1)), None),
+                col(rand_column_name),
+            ],
+        })
+        .alias(&array_column_name);
+        let plan = LogicalPlanBuilder::from(plan_with_rand)
+            .project(
+                init_exprs_aux
+                    .into_iter()
+                    .chain(vec![arr_expr])
+                    .map(Into::into)
+                    .collect::<Vec<SelectExpr>>(),
+            )?
+            .build()?;
+        let plan = LogicalPlanBuilder::from(plan)
+            .unnest_column(array_column_name)?
+            .build()?;
+        let plan = LogicalPlanBuilder::from(plan)
+            .project(
+                init_exprs
+                    .into_iter()
+                    .map(Into::into)
+                    .collect::<Vec<SelectExpr>>(),
+            )?
+            .build()?;
+        Ok(plan)
     }
 }
