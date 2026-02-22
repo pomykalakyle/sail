@@ -264,11 +264,14 @@ mod tests {
     use futures::StreamExt;
     use sail_common::config::AppConfig;
     use sail_common::runtime::{RuntimeHandle, RuntimeManager};
+    use sail_common::spec;
+    use sail_common_datafusion::extension::SessionExtensionAccessor;
 
     use crate::error::SparkResult;
     use crate::executor::ExecutorMetadata;
     use crate::service::handle_execute_relation;
     use crate::session::SparkSessionKey;
+    use crate::session::{DataFrameCacheState, SparkSession};
     use crate::session_manager::create_spark_session_manager;
     use crate::spark::connect::analyze_plan_request::{
         GetStorageLevel as GetStorageLevelRequest, Persist as PersistRequest,
@@ -411,6 +414,7 @@ mod tests {
         let (handle, context) = create_test_context()?;
         let relation = sql_relation("SELECT 1 AS x", 2002);
         handle.primary().block_on(async {
+            let plan: spec::QueryPlan = relation.clone().try_into()?;
             super::handle_analyze_persist(
                 &context,
                 PersistRequest {
@@ -438,18 +442,38 @@ mod tests {
                     replication: 1,
                 }
             );
+            let spark = context.extension::<SparkSession>()?;
+            let entry = spark
+                .get_dataframe_cache_entry(&plan)?
+                .ok_or_else(|| crate::error::SparkError::internal("missing cache entry"))?;
+            assert_eq!(entry.state, DataFrameCacheState::Pending);
+            assert_eq!(entry.materialization_count, 0);
+            assert_eq!(entry.hit_count, 0);
 
             let first = count_rows(
                 execute_relation_and_collect_batches(&context, relation.clone())
                     .await?
                     .as_slice(),
             );
+            let entry = spark
+                .get_dataframe_cache_entry(&plan)?
+                .ok_or_else(|| crate::error::SparkError::internal("missing cache entry"))?;
+            assert_eq!(entry.state, DataFrameCacheState::Materialized);
+            assert_eq!(entry.materialization_count, 1);
+            let first_hit_count = entry.hit_count;
+            assert!(first_hit_count >= 1);
+
             let second = count_rows(
                 execute_relation_and_collect_batches(&context, relation.clone())
                     .await?
                     .as_slice(),
             );
             assert_eq!(first, second);
+            let entry = spark
+                .get_dataframe_cache_entry(&plan)?
+                .ok_or_else(|| crate::error::SparkError::internal("missing cache entry"))?;
+            assert_eq!(entry.materialization_count, 1);
+            assert!(entry.hit_count > first_hit_count);
 
             super::handle_analyze_unpersist(
                 &context,
@@ -466,6 +490,7 @@ mod tests {
                     .as_slice(),
             );
             assert_eq!(second, third);
+            assert!(spark.get_dataframe_cache_entry(&plan)?.is_none());
             Ok::<(), crate::error::SparkError>(())
         })?;
         Ok(())

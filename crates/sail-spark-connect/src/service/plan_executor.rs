@@ -163,6 +163,13 @@ async fn handle_execute_plan(
     ))
 }
 
+fn to_cached_remote_relation_plan(query: &spec::QueryPlan, relation_id: String) -> spec::Plan {
+    spec::Plan::Query(spec::QueryPlan {
+        node: spec::QueryNode::CachedRemoteRelation { relation_id },
+        plan_id: query.plan_id,
+    })
+}
+
 fn ensure_dataframe_cache_namespace(ctx: &SessionContext) -> SparkResult<()> {
     let catalog = if let Some(catalog) = ctx.catalog(DATAFRAME_CACHE_CATALOG) {
         catalog
@@ -189,10 +196,19 @@ async fn materialize_dataframe_cache(
     ensure_dataframe_cache_namespace(ctx)?;
     let service = ctx.extension::<JobService>()?;
     let (plan, _) =
-        resolve_and_execute_plan(ctx, spark.plan_config()?, spec::Plan::Query(query)).await?;
+        resolve_and_execute_plan(ctx, spark.plan_config()?, spec::Plan::Query(query.clone()))
+            .await?;
     let stream = service.runner().execute(ctx, plan).await?;
     let schema = stream.schema();
     let batches = read_stream(stream).await?;
+    // If the relation was unpersisted while we were computing, skip publication.
+    if !spark.should_publish_dataframe_cache(&query, relation_id)? {
+        debug!(
+            "skipping dataframe cache publication for '{}': relation is no longer persisted",
+            relation_id
+        );
+        return Ok(());
+    }
     let provider = Arc::new(MemTable::try_new(schema, vec![batches])?);
     let _ = ctx.deregister_table(relation_id);
     ctx.register_table(relation_id.to_string(), provider)
@@ -201,6 +217,10 @@ async fn materialize_dataframe_cache(
                 "failed to register dataframe cache table '{relation_id}': {e}"
             ))
         })?;
+    // Unpersist can race between the validation above and registration; clean up eagerly.
+    if !spark.should_publish_dataframe_cache(&query, relation_id)? {
+        let _ = ctx.deregister_table(relation_id);
+    }
     Ok(())
 }
 
@@ -212,22 +232,30 @@ pub(crate) async fn handle_execute_relation(
     let spark = ctx.extension::<SparkSession>()?;
     let plan: spec::Plan = relation.try_into()?;
     if let spec::Plan::Query(query) = &plan {
-        match spark.acquire_dataframe_cache(query)? {
-            DataFrameCacheAcquire::NotPersisted => {}
-            DataFrameCacheAcquire::Ready(entry) => {
-                debug!("dataframe cache '{}' is materialized", entry.relation_id);
-            }
-            DataFrameCacheAcquire::InProgress => {}
-            DataFrameCacheAcquire::StartMaterialization(entry) => {
-                let result =
-                    materialize_dataframe_cache(ctx, &spark, query.clone(), &entry.relation_id)
-                        .await;
-                spark.finish_dataframe_cache_materialization(query, result.is_ok())?;
-                if let Err(error) = result {
-                    warn!(
-                        "failed to materialize dataframe cache '{}': {error}",
-                        entry.relation_id
-                    );
+        loop {
+            match spark.acquire_dataframe_cache(query)? {
+                DataFrameCacheAcquire::NotPersisted => break,
+                DataFrameCacheAcquire::Ready(entry) => {
+                    debug!("using dataframe cache '{}'", entry.relation_id);
+                    spark.record_dataframe_cache_hit(query)?;
+                    let plan = to_cached_remote_relation_plan(query, entry.relation_id);
+                    return handle_execute_plan(ctx, plan, metadata, ExecutePlanMode::Lazy).await;
+                }
+                DataFrameCacheAcquire::InProgress(notifier) => {
+                    // Avoid racing with cache publication: only wait if the cache is still
+                    // materializing after we subscribe to notifications.
+                    let notified = notifier.notified();
+                    if !spark.is_dataframe_cache_materializing(query)? {
+                        continue;
+                    }
+                    notified.await;
+                }
+                DataFrameCacheAcquire::StartMaterialization(entry) => {
+                    let result =
+                        materialize_dataframe_cache(ctx, &spark, query.clone(), &entry.relation_id)
+                            .await;
+                    spark.finish_dataframe_cache_materialization(query, result.is_ok())?;
+                    result?;
                 }
             }
         }

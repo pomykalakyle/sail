@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use datafusion::catalog::TableProvider;
 use sail_common_datafusion::extension::SessionExtension;
 
 use crate::error::{CatalogError, CatalogResult};
@@ -25,6 +26,9 @@ pub(super) struct CatalogManagerState {
     pub(super) default_catalog: Arc<str>,
     pub(super) default_database: Namespace,
     pub(super) global_temporary_database: Namespace,
+    pub(super) cached_tables: HashSet<String>,
+    pub(super) cached_table_relations: HashMap<String, String>,
+    pub(super) cached_table_providers: HashMap<String, Arc<dyn TableProvider>>,
 }
 
 pub struct CatalogManagerOptions {
@@ -55,6 +59,9 @@ impl CatalogManager {
             default_catalog: options.default_catalog.into(),
             default_database: options.default_database.try_into()?,
             global_temporary_database: options.global_temporary_database.try_into()?,
+            cached_tables: HashSet::new(),
+            cached_table_relations: HashMap::new(),
+            cached_table_providers: HashMap::new(),
         };
         Ok(CatalogManager {
             state: Arc::new(Mutex::new(state)),

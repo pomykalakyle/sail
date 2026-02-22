@@ -11,6 +11,7 @@ use sail_common::datetime::get_system_timezone;
 use sail_common::spec;
 use sail_common_datafusion::extension::SessionExtension;
 use sail_plan::config::PlanConfig;
+use tokio::sync::Notify;
 use sail_session::session_manager::SessionKey;
 
 use crate::config::{ConfigKeyValue, SparkRuntimeConfig};
@@ -62,13 +63,15 @@ pub(crate) struct DataFrameCacheEntry {
     pub relation_id: String,
     pub storage_level: spec::StorageLevel,
     pub state: DataFrameCacheState,
+    pub materialization_count: usize,
+    pub hit_count: usize,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) enum DataFrameCacheAcquire {
     NotPersisted,
     Ready(DataFrameCacheEntry),
-    InProgress,
+    InProgress(Arc<Notify>),
     StartMaterialization(DataFrameCacheEntry),
 }
 
@@ -99,6 +102,17 @@ impl SessionExtension for SparkSession {
 }
 
 impl SparkSession {
+    fn dataframe_cache_notifier(
+        state: &mut SparkSessionState,
+        key: &DataFrameCacheKey,
+    ) -> Arc<Notify> {
+        state
+            .dataframe_cache_notifiers
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone()
+    }
+
     fn cache_key_for_query_plan(plan: &spec::QueryPlan) -> SparkResult<DataFrameCacheKey> {
         if let Some(plan_id) = plan.plan_id {
             Ok(DataFrameCacheKey::PlanId(plan_id))
@@ -287,10 +301,23 @@ impl SparkSession {
             .get(&key)
             .map(|entry| entry.state)
             .unwrap_or(DataFrameCacheState::Pending);
+        let materialization_count = state
+            .dataframe_cache
+            .get(&key)
+            .map(|entry| entry.materialization_count)
+            .unwrap_or(0);
+        let hit_count = state
+            .dataframe_cache
+            .get(&key)
+            .map(|entry| entry.hit_count)
+            .unwrap_or(0);
+        Self::dataframe_cache_notifier(&mut state, &key);
         let entry = DataFrameCacheEntry {
             relation_id,
             storage_level,
             state: cache_state,
+            materialization_count,
+            hit_count,
         };
         state.dataframe_cache.insert(key, entry.clone());
         Ok(entry)
@@ -302,7 +329,11 @@ impl SparkSession {
     ) -> SparkResult<Option<DataFrameCacheEntry>> {
         let key = Self::cache_key_for_query_plan(plan)?;
         let mut state = self.state.lock()?;
-        Ok(state.dataframe_cache.remove(&key))
+        let entry = state.dataframe_cache.remove(&key);
+        if let Some(notifier) = state.dataframe_cache_notifiers.remove(&key) {
+            notifier.notify_waiters();
+        }
+        Ok(entry)
     }
 
     pub(crate) fn unpersist_dataframe_cache_by_relation_id(
@@ -310,11 +341,24 @@ impl SparkSession {
         relation_id: &str,
     ) -> SparkResult<bool> {
         let mut state = self.state.lock()?;
-        let previous_len = state.dataframe_cache.len();
-        state
+        let keys = state
             .dataframe_cache
-            .retain(|_, entry| entry.relation_id != relation_id);
-        Ok(state.dataframe_cache.len() != previous_len)
+            .iter()
+            .filter_map(|(key, entry)| {
+                if entry.relation_id == relation_id {
+                    Some(key.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        for key in &keys {
+            state.dataframe_cache.remove(key);
+            if let Some(notifier) = state.dataframe_cache_notifiers.remove(key) {
+                notifier.notify_waiters();
+            }
+        }
+        Ok(!keys.is_empty())
     }
 
     pub(crate) fn get_dataframe_cache_storage_level(
@@ -329,22 +373,79 @@ impl SparkSession {
             .map(|entry| entry.storage_level.clone()))
     }
 
+    #[cfg(test)]
+    pub(crate) fn get_dataframe_cache_entry(
+        &self,
+        plan: &spec::QueryPlan,
+    ) -> SparkResult<Option<DataFrameCacheEntry>> {
+        let key = Self::cache_key_for_query_plan(plan)?;
+        let state = self.state.lock()?;
+        Ok(state.dataframe_cache.get(&key).cloned())
+    }
+
+    pub(crate) fn is_dataframe_cache_materializing(
+        &self,
+        plan: &spec::QueryPlan,
+    ) -> SparkResult<bool> {
+        let key = Self::cache_key_for_query_plan(plan)?;
+        let state = self.state.lock()?;
+        Ok(matches!(
+            state.dataframe_cache.get(&key).map(|entry| entry.state),
+            Some(DataFrameCacheState::Materializing)
+        ))
+    }
+
+    pub(crate) fn record_dataframe_cache_hit(&self, plan: &spec::QueryPlan) -> SparkResult<()> {
+        let key = Self::cache_key_for_query_plan(plan)?;
+        let mut state = self.state.lock()?;
+        if let Some(entry) = state.dataframe_cache.get_mut(&key) {
+            entry.hit_count += 1;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn should_publish_dataframe_cache(
+        &self,
+        plan: &spec::QueryPlan,
+        relation_id: &str,
+    ) -> SparkResult<bool> {
+        let key = Self::cache_key_for_query_plan(plan)?;
+        let state = self.state.lock()?;
+        Ok(matches!(
+            state.dataframe_cache.get(&key),
+            Some(entry)
+                if entry.relation_id == relation_id
+                    && entry.state == DataFrameCacheState::Materializing
+        ))
+    }
+
     pub(crate) fn acquire_dataframe_cache(
         &self,
         plan: &spec::QueryPlan,
     ) -> SparkResult<DataFrameCacheAcquire> {
         let key = Self::cache_key_for_query_plan(plan)?;
         let mut state = self.state.lock()?;
-        let Some(entry) = state.dataframe_cache.get_mut(&key) else {
-            return Ok(DataFrameCacheAcquire::NotPersisted);
-        };
-        match entry.state {
-            DataFrameCacheState::Pending => {
-                entry.state = DataFrameCacheState::Materializing;
-                Ok(DataFrameCacheAcquire::StartMaterialization(entry.clone()))
+        let acquire = {
+            let Some(entry) = state.dataframe_cache.get_mut(&key) else {
+                return Ok(DataFrameCacheAcquire::NotPersisted);
+            };
+            match entry.state {
+                DataFrameCacheState::Pending => {
+                    entry.state = DataFrameCacheState::Materializing;
+                    Some(DataFrameCacheAcquire::StartMaterialization(entry.clone()))
+                }
+                DataFrameCacheState::Materialized => {
+                    Some(DataFrameCacheAcquire::Ready(entry.clone()))
+                }
+                DataFrameCacheState::Materializing => None,
             }
-            DataFrameCacheState::Materializing => Ok(DataFrameCacheAcquire::InProgress),
-            DataFrameCacheState::Materialized => Ok(DataFrameCacheAcquire::Ready(entry.clone())),
+        };
+        if let Some(acquire) = acquire {
+            Ok(acquire)
+        } else {
+            Ok(DataFrameCacheAcquire::InProgress(
+                Self::dataframe_cache_notifier(&mut state, &key),
+            ))
         }
     }
 
@@ -361,6 +462,12 @@ impl SparkSession {
             } else {
                 DataFrameCacheState::Pending
             };
+            if success {
+                entry.materialization_count += 1;
+            }
+        }
+        if let Some(notifier) = state.dataframe_cache_notifiers.get(&key) {
+            notifier.notify_waiters();
         }
         Ok(())
     }
@@ -458,6 +565,7 @@ struct SparkSessionState {
     config: SparkRuntimeConfig,
     executors: HashMap<String, Arc<Executor>>,
     dataframe_cache: HashMap<DataFrameCacheKey, DataFrameCacheEntry>,
+    dataframe_cache_notifiers: HashMap<DataFrameCacheKey, Arc<Notify>>,
     streaming_queries: StreamingQueryManager,
 }
 
@@ -467,6 +575,7 @@ impl SparkSessionState {
             config: SparkRuntimeConfig::new(),
             executors: HashMap::new(),
             dataframe_cache: HashMap::new(),
+            dataframe_cache_notifiers: HashMap::new(),
             streaming_queries: StreamingQueryManager::new(),
         }
     }

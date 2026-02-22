@@ -1,7 +1,16 @@
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+
 use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{Schema, SchemaRef};
+use datafusion::catalog::MemTable;
+use datafusion::catalog::TableProvider;
+use datafusion::physical_plan::collect;
 use datafusion::prelude::SessionContext;
+use datafusion_common::Constraints;
 use datafusion_expr::ScalarUDF;
+use sail_common_datafusion::catalog::{TableKind, TableStatus};
+use sail_common_datafusion::datasource::{SourceInfo, TableFormatRegistry};
 use sail_common_datafusion::extension::SessionExtensionAccessor;
 use sail_common_datafusion::session::PlanService;
 
@@ -66,6 +75,20 @@ pub enum CatalogCommand {
         table: Vec<String>,
         options: DropTableOptions,
     },
+    IsCached {
+        table: Vec<String>,
+    },
+    CacheTable {
+        table: Vec<String>,
+    },
+    UncacheTable {
+        table: Vec<String>,
+        if_exists: bool,
+    },
+    ClearCache,
+    RefreshTable {
+        table: Vec<String>,
+    },
     ListColumns {
         table: Vec<String>,
     },
@@ -120,6 +143,121 @@ pub enum CatalogTableFunction {
     // PySpark UDTF is registered as a scalar UDF.
 }
 
+fn cached_table_relation_id(cache_key: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    cache_key.hash(&mut hasher);
+    format!("__sail_cached_table_{:016x}", hasher.finish())
+}
+
+async fn materialize_table_status_batches(
+    ctx: &SessionContext,
+    status: TableStatus,
+) -> CatalogResult<(SchemaRef, Vec<RecordBatch>)> {
+    let status_name = status.name;
+    let status_database = status.kind.database();
+    match status.kind {
+        TableKind::Table {
+            catalog: _,
+            database: _,
+            columns,
+            comment: _,
+            constraints: _,
+            location,
+            format,
+            partition_by,
+            sort_by,
+            bucket_by,
+            options,
+            properties: _,
+        } => {
+            let schema = Schema::new(columns.iter().map(|x| x.field()).collect::<Vec<_>>());
+            let info = SourceInfo {
+                paths: location.map(|path| vec![path]).unwrap_or_default(),
+                schema: Some(schema),
+                constraints: Constraints::default(),
+                partition_by,
+                bucket_by: bucket_by.map(|value| value.into()),
+                sort_order: sort_by.into_iter().map(|value| value.into()).collect(),
+                options: vec![options.into_iter().collect()],
+            };
+            let registry = ctx.extension::<TableFormatRegistry>()?;
+            let table_format = registry.get(&format).map_err(|e| {
+                CatalogError::Internal(format!(
+                    "cache table format lookup failed for {}.{} using format {format}: {e}",
+                    status_database.join("."),
+                    status_name
+                ))
+            })?;
+            let table_provider = table_format
+                .create_provider(&ctx.state(), info)
+                .await
+                .map_err(|e| {
+                    CatalogError::Internal(format!(
+                        "cache table provider creation failed for {}.{} using format {format}: {e}",
+                        status_database.join("."),
+                        status_name
+                    ))
+                })?;
+            let filters = vec![];
+            let physical = table_provider
+                .scan(&ctx.state(), None, filters.as_slice(), None)
+                .await
+                .map_err(|e| {
+                    CatalogError::Internal(format!(
+                        "cache table scan planning failed for {}.{}: {e}",
+                        status_database.join("."),
+                        status_name
+                    ))
+                })?;
+            let schema = physical.schema();
+            let batches = collect(physical, ctx.task_ctx()).await.map_err(|e| {
+                CatalogError::Internal(format!(
+                    "cache table execution failed for {}.{}: {e}",
+                    status_database.join("."),
+                    status_name
+                ))
+            })?;
+            Ok((schema, batches))
+        }
+        TableKind::TemporaryView { plan, .. } | TableKind::GlobalTemporaryView { plan, .. } => {
+            let physical = ctx
+                .state()
+                .create_physical_plan(plan.as_ref())
+                .await
+                .map_err(|e| {
+                    CatalogError::Internal(format!(
+                        "cache view planning failed for {}.{}: {e}",
+                        status_database.join("."),
+                        status_name
+                    ))
+                })?;
+            let schema = physical.schema();
+            let batches = collect(physical, ctx.task_ctx()).await.map_err(|e| {
+                CatalogError::Internal(format!(
+                    "cache view execution failed for {}.{}: {e}",
+                    status_database.join("."),
+                    status_name
+                  ))
+            })?;
+            Ok((schema, batches))
+        }
+        TableKind::View { .. } => Err(CatalogError::NotSupported("cache view".to_string())),
+    }
+}
+
+async fn materialize_table_cache(
+    ctx: &SessionContext,
+    manager: &CatalogManager,
+    table: &[String],
+) -> CatalogResult<(String, Arc<dyn TableProvider>)> {
+    let key = manager.cache_key_for_table(table).await?;
+    let relation_id = cached_table_relation_id(&key);
+    let status = manager.get_table_or_view(table).await?;
+    let (schema, batches) = materialize_table_status_batches(ctx, status).await?;
+    let provider: Arc<dyn TableProvider> = Arc::new(MemTable::try_new(schema, vec![batches])?);
+    Ok((relation_id, provider))
+}
+
 impl CatalogCommand {
     pub fn name(&self) -> &str {
         match self {
@@ -139,6 +277,11 @@ impl CatalogCommand {
             CatalogCommand::ListTables { .. } => "ListTables",
             CatalogCommand::ListViews { .. } => "ListViews",
             CatalogCommand::DropTable { .. } => "DropTable",
+            CatalogCommand::IsCached { .. } => "IsCached",
+            CatalogCommand::CacheTable { .. } => "CacheTable",
+            CatalogCommand::UncacheTable { .. } => "UncacheTable",
+            CatalogCommand::ClearCache => "ClearCache",
+            CatalogCommand::RefreshTable { .. } => "RefreshTable",
             CatalogCommand::ListColumns { .. } => "ListColumns",
             CatalogCommand::FunctionExists { .. } => "FunctionExists",
             CatalogCommand::GetFunction { .. } => "GetFunction",
@@ -171,12 +314,17 @@ impl CatalogCommand {
             CatalogCommand::SetCurrentCatalog { .. }
             | CatalogCommand::SetCurrentDatabase { .. }
             | CatalogCommand::RegisterFunction { .. }
-            | CatalogCommand::RegisterTableFunction { .. } => display.empty().schema()?,
+            | CatalogCommand::RegisterTableFunction { .. }
+            | CatalogCommand::CacheTable { .. }
+            | CatalogCommand::UncacheTable { .. }
+            | CatalogCommand::RefreshTable { .. }
+            | CatalogCommand::ClearCache => display.empty().schema()?,
             CatalogCommand::CurrentCatalog | CatalogCommand::CurrentDatabase => {
                 display.strings().schema()?
             }
             CatalogCommand::DatabaseExists { .. }
             | CatalogCommand::TableExists { .. }
+            | CatalogCommand::IsCached { .. }
             | CatalogCommand::FunctionExists { .. }
             | CatalogCommand::CreateDatabase { .. }
             | CatalogCommand::CreateTable { .. }
@@ -289,6 +437,38 @@ impl CatalogCommand {
             CatalogCommand::DropTable { table, options } => {
                 manager.drop_table(&table, options).await?;
                 display.bools().to_record_batch(vec![true])?
+            }
+            CatalogCommand::IsCached { table } => {
+                let value = manager.is_cached_table(&table).await?;
+                display.bools().to_record_batch(vec![value])?
+            }
+            CatalogCommand::CacheTable { table } => {
+                manager.cache_table(&table).await?;
+                let (relation_id, provider) =
+                    match materialize_table_cache(ctx, manager, &table).await {
+                        Ok(result) => result,
+                        Err(error) => {
+                            let _ = manager.uncache_table(&table, true).await;
+                            return Err(error);
+                        }
+                    };
+                manager
+                    .set_cached_table_relation(&table, relation_id.clone())
+                    .await?;
+                manager.set_cached_table_provider(relation_id, provider)?;
+                display.empty().to_record_batch(vec![])?
+            }
+            CatalogCommand::UncacheTable { table, if_exists } => {
+                let _ = manager.uncache_table(&table, if_exists).await?;
+                display.empty().to_record_batch(vec![])?
+            }
+            CatalogCommand::ClearCache => {
+                let _ = manager.clear_cached_tables()?;
+                display.empty().to_record_batch(vec![])?
+            }
+            CatalogCommand::RefreshTable { table } => {
+                let _ = manager.refresh_table(&table).await?;
+                display.empty().to_record_batch(vec![])?
             }
             CatalogCommand::ListColumns { table } => {
                 let rows = manager.get_table_or_view(&table).await?.kind.columns();

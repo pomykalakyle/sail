@@ -47,11 +47,32 @@ impl PlanResolver<'_> {
         }
 
         let reference: Vec<String> = name.clone().into();
-        let status = self
-            .ctx
-            .extension::<CatalogManager>()?
-            .get_table_or_view(&reference)
-            .await?;
+        let manager = self.ctx.extension::<CatalogManager>()?;
+        let reference: Vec<String> = name.clone().into();
+        if let Some(relation_id) = manager.cache_relation_id_for_table(&reference).await? {
+            if let Some(table_provider) = manager.cached_table_provider(&relation_id)? {
+                return self.resolve_table_provider_with_rename(
+                    table_provider,
+                    table_reference,
+                    None,
+                    vec![],
+                    None,
+                    state,
+                );
+            }
+            if let Ok(table_provider) = self.ctx.table_provider(relation_id.as_str()).await {
+                return self.resolve_table_provider_with_rename(
+                    table_provider,
+                    table_reference,
+                    None,
+                    vec![],
+                    None,
+                    state,
+                );
+            }
+        }
+
+        let status = manager.get_table_or_view(&reference).await?;
         let plan = match status.kind {
             TableKind::Table {
                 catalog: _,
