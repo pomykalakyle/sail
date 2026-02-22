@@ -56,10 +56,37 @@ impl CatalogManager {
         Ok(state.cached_tables.contains(&key))
     }
 
-    pub async fn cache_table<T: AsRef<str>>(&self, table: &[T]) -> CatalogResult<()> {
+    pub async fn is_lazy_cached_table<T: AsRef<str>>(&self, table: &[T]) -> CatalogResult<bool> {
+        let key = self.resolve_cache_key(table).await?;
+        let state = self.state()?;
+        Ok(state.lazy_cached_tables.contains(&key))
+    }
+
+    pub async fn is_disk_cached_table<T: AsRef<str>>(&self, table: &[T]) -> CatalogResult<bool> {
+        let key = self.resolve_cache_key(table).await?;
+        let state = self.state()?;
+        Ok(state.disk_cached_tables.contains(&key))
+    }
+
+    pub async fn cache_table<T: AsRef<str>>(
+        &self,
+        table: &[T],
+        lazy: bool,
+        disk_backed: bool,
+    ) -> CatalogResult<()> {
         let key = self.resolve_cache_key(table).await?;
         let mut state = self.state()?;
-        state.cached_tables.insert(key);
+        state.cached_tables.insert(key.clone());
+        if lazy {
+            state.lazy_cached_tables.insert(key.clone());
+        } else {
+            state.lazy_cached_tables.remove(&key);
+        }
+        if disk_backed {
+            state.disk_cached_tables.insert(key);
+        } else {
+            state.disk_cached_tables.remove(&key);
+        }
         Ok(())
     }
 
@@ -71,6 +98,7 @@ impl CatalogManager {
         let key = self.resolve_cache_key(table).await?;
         let mut state = self.state()?;
         state.cached_tables.insert(key.clone());
+        state.lazy_cached_tables.remove(&key);
         state.cached_table_relations.insert(key, relation_id);
         Ok(())
     }
@@ -114,6 +142,8 @@ impl CatalogManager {
         };
         let mut state = self.state()?;
         state.cached_tables.remove(&key);
+        state.lazy_cached_tables.remove(&key);
+        state.disk_cached_tables.remove(&key);
         let relation_id = state.cached_table_relations.remove(&key);
         if let Some(relation_id) = relation_id.as_ref() {
             state.cached_table_providers.remove(relation_id);
@@ -129,6 +159,8 @@ impl CatalogManager {
     pub fn clear_cached_tables(&self) -> CatalogResult<Vec<String>> {
         let mut state = self.state()?;
         state.cached_tables.clear();
+        state.lazy_cached_tables.clear();
+        state.disk_cached_tables.clear();
         state.cached_table_providers.clear();
         let relations = state
             .cached_table_relations
@@ -137,6 +169,7 @@ impl CatalogManager {
             .collect();
         Ok(relations)
     }
+
     pub async fn create_table<T: AsRef<str>>(
         &self,
         table: &[T],

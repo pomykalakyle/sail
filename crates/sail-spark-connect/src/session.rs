@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
@@ -102,6 +102,14 @@ impl SessionExtension for SparkSession {
 }
 
 impl SparkSession {
+    fn cleanup_dataframe_cache_notifier(state: &mut SparkSessionState, key: &DataFrameCacheKey) {
+        if !state.dataframe_cache.contains_key(key)
+            && !state.dataframe_cache_materializing.contains(key)
+        {
+            state.dataframe_cache_notifiers.remove(key);
+        }
+    }
+
     fn dataframe_cache_notifier(
         state: &mut SparkSessionState,
         key: &DataFrameCacheKey,
@@ -300,7 +308,13 @@ impl SparkSession {
             .dataframe_cache
             .get(&key)
             .map(|entry| entry.state)
-            .unwrap_or(DataFrameCacheState::Pending);
+            .unwrap_or_else(|| {
+                if state.dataframe_cache_materializing.contains(&key) {
+                    DataFrameCacheState::Materializing
+                } else {
+                    DataFrameCacheState::Pending
+                }
+            });
         let materialization_count = state
             .dataframe_cache
             .get(&key)
@@ -330,9 +344,10 @@ impl SparkSession {
         let key = Self::cache_key_for_query_plan(plan)?;
         let mut state = self.state.lock()?;
         let entry = state.dataframe_cache.remove(&key);
-        if let Some(notifier) = state.dataframe_cache_notifiers.remove(&key) {
+        if let Some(notifier) = state.dataframe_cache_notifiers.get(&key) {
             notifier.notify_waiters();
         }
+        Self::cleanup_dataframe_cache_notifier(&mut state, &key);
         Ok(entry)
     }
 
@@ -354,9 +369,10 @@ impl SparkSession {
             .collect::<Vec<_>>();
         for key in &keys {
             state.dataframe_cache.remove(key);
-            if let Some(notifier) = state.dataframe_cache_notifiers.remove(key) {
+            if let Some(notifier) = state.dataframe_cache_notifiers.get(key) {
                 notifier.notify_waiters();
             }
+            Self::cleanup_dataframe_cache_notifier(&mut state, key);
         }
         Ok(!keys.is_empty())
     }
@@ -389,10 +405,36 @@ impl SparkSession {
     ) -> SparkResult<bool> {
         let key = Self::cache_key_for_query_plan(plan)?;
         let state = self.state.lock()?;
-        Ok(matches!(
-            state.dataframe_cache.get(&key).map(|entry| entry.state),
-            Some(DataFrameCacheState::Materializing)
-        ))
+        Ok(state.dataframe_cache_materializing.contains(&key))
+    }
+
+    pub(crate) fn dataframe_cache_materialization_notifier(
+        &self,
+        plan: &spec::QueryPlan,
+    ) -> SparkResult<Option<Arc<Notify>>> {
+        let key = Self::cache_key_for_query_plan(plan)?;
+        let mut state = self.state.lock()?;
+        if state.dataframe_cache_materializing.contains(&key) {
+            Ok(Some(Self::dataframe_cache_notifier(&mut state, &key)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(crate) async fn wait_for_dataframe_cache_materialization(
+        &self,
+        plan: &spec::QueryPlan,
+    ) -> SparkResult<()> {
+        loop {
+            let Some(notifier) = self.dataframe_cache_materialization_notifier(plan)? else {
+                return Ok(());
+            };
+            let notified = notifier.notified();
+            if !self.is_dataframe_cache_materializing(plan)? {
+                continue;
+            }
+            notified.await;
+        }
     }
 
     pub(crate) fn record_dataframe_cache_hit(&self, plan: &spec::QueryPlan) -> SparkResult<()> {
@@ -416,6 +458,7 @@ impl SparkSession {
             Some(entry)
                 if entry.relation_id == relation_id
                     && entry.state == DataFrameCacheState::Materializing
+                    && state.dataframe_cache_materializing.contains(&key)
         ))
     }
 
@@ -425,27 +468,32 @@ impl SparkSession {
     ) -> SparkResult<DataFrameCacheAcquire> {
         let key = Self::cache_key_for_query_plan(plan)?;
         let mut state = self.state.lock()?;
-        let acquire = {
-            let Some(entry) = state.dataframe_cache.get_mut(&key) else {
-                return Ok(DataFrameCacheAcquire::NotPersisted);
-            };
-            match entry.state {
-                DataFrameCacheState::Pending => {
-                    entry.state = DataFrameCacheState::Materializing;
-                    Some(DataFrameCacheAcquire::StartMaterialization(entry.clone()))
-                }
-                DataFrameCacheState::Materialized => {
-                    Some(DataFrameCacheAcquire::Ready(entry.clone()))
-                }
-                DataFrameCacheState::Materializing => None,
-            }
+        let Some(entry_state) = state.dataframe_cache.get(&key).map(|entry| entry.state) else {
+            return Ok(DataFrameCacheAcquire::NotPersisted);
         };
-        if let Some(acquire) = acquire {
-            Ok(acquire)
-        } else {
-            Ok(DataFrameCacheAcquire::InProgress(
+        match entry_state {
+            DataFrameCacheState::Pending => {
+                let entry = {
+                    let entry = state
+                        .dataframe_cache
+                        .get_mut(&key)
+                        .ok_or_else(|| SparkError::internal("missing dataframe cache entry"))?;
+                    entry.state = DataFrameCacheState::Materializing;
+                    entry.clone()
+                };
+                state.dataframe_cache_materializing.insert(key);
+                Ok(DataFrameCacheAcquire::StartMaterialization(entry))
+            }
+            DataFrameCacheState::Materialized => Ok(DataFrameCacheAcquire::Ready(
+                state
+                    .dataframe_cache
+                    .get(&key)
+                    .ok_or_else(|| SparkError::internal("missing dataframe cache entry"))?
+                    .clone(),
+            )),
+            DataFrameCacheState::Materializing => Ok(DataFrameCacheAcquire::InProgress(
                 Self::dataframe_cache_notifier(&mut state, &key),
-            ))
+            )),
         }
     }
 
@@ -456,6 +504,7 @@ impl SparkSession {
     ) -> SparkResult<()> {
         let key = Self::cache_key_for_query_plan(plan)?;
         let mut state = self.state.lock()?;
+        state.dataframe_cache_materializing.remove(&key);
         if let Some(entry) = state.dataframe_cache.get_mut(&key) {
             entry.state = if success {
                 DataFrameCacheState::Materialized
@@ -469,6 +518,7 @@ impl SparkSession {
         if let Some(notifier) = state.dataframe_cache_notifiers.get(&key) {
             notifier.notify_waiters();
         }
+        Self::cleanup_dataframe_cache_notifier(&mut state, &key);
         Ok(())
     }
 
@@ -565,6 +615,7 @@ struct SparkSessionState {
     config: SparkRuntimeConfig,
     executors: HashMap<String, Arc<Executor>>,
     dataframe_cache: HashMap<DataFrameCacheKey, DataFrameCacheEntry>,
+    dataframe_cache_materializing: HashSet<DataFrameCacheKey>,
     dataframe_cache_notifiers: HashMap<DataFrameCacheKey, Arc<Notify>>,
     streaming_queries: StreamingQueryManager,
 }
@@ -575,6 +626,7 @@ impl SparkSessionState {
             config: SparkRuntimeConfig::new(),
             executors: HashMap::new(),
             dataframe_cache: HashMap::new(),
+            dataframe_cache_materializing: HashSet::new(),
             dataframe_cache_notifiers: HashMap::new(),
             streaming_queries: StreamingQueryManager::new(),
         }

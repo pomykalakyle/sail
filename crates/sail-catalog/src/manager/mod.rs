@@ -27,6 +27,8 @@ pub(super) struct CatalogManagerState {
     pub(super) default_database: Namespace,
     pub(super) global_temporary_database: Namespace,
     pub(super) cached_tables: HashSet<String>,
+    pub(super) lazy_cached_tables: HashSet<String>,
+    pub(super) disk_cached_tables: HashSet<String>,
     pub(super) cached_table_relations: HashMap<String, String>,
     pub(super) cached_table_providers: HashMap<String, Arc<dyn TableProvider>>,
 }
@@ -60,6 +62,8 @@ impl CatalogManager {
             default_database: options.default_database.try_into()?,
             global_temporary_database: options.global_temporary_database.try_into()?,
             cached_tables: HashSet::new(),
+            lazy_cached_tables: HashSet::new(),
+            disk_cached_tables: HashSet::new(),
             cached_table_relations: HashMap::new(),
             cached_table_providers: HashMap::new(),
         };

@@ -11,6 +11,7 @@ use fastrace::Span;
 use futures::stream;
 use log::{debug, warn};
 use sail_common::spec;
+use sail_common_datafusion::cache::create_ipc_file_table_provider;
 use sail_common_datafusion::extension::SessionExtensionAccessor;
 use sail_common_datafusion::session::JobService;
 use sail_plan::resolve_and_execute_plan;
@@ -23,7 +24,6 @@ use crate::executor::{
     read_stream, to_arrow_batch, Executor, ExecutorBatch, ExecutorMetadata, ExecutorOutput,
     ExecutorOutputStream,
 };
-use crate::session::SparkSession;
 use crate::session::{
     DataFrameCacheAcquire, SparkSession, DATAFRAME_CACHE_CATALOG, DATAFRAME_CACHE_SCHEMA,
 };
@@ -191,8 +191,9 @@ async fn materialize_dataframe_cache(
     ctx: &SessionContext,
     spark: &SparkSession,
     query: spec::QueryPlan,
-    relation_id: &str,
+    entry: &crate::session::DataFrameCacheEntry,
 ) -> SparkResult<()> {
+    let relation_id = &entry.relation_id;
     ensure_dataframe_cache_namespace(ctx)?;
     let service = ctx.extension::<JobService>()?;
     let (plan, _) =
@@ -209,7 +210,11 @@ async fn materialize_dataframe_cache(
         );
         return Ok(());
     }
-    let provider = Arc::new(MemTable::try_new(schema, vec![batches])?);
+    let provider = if entry.storage_level.use_disk {
+        create_ipc_file_table_provider(relation_id.as_str(), schema, batches.as_slice())?
+    } else {
+        Arc::new(MemTable::try_new(schema, vec![batches])?)
+    };
     let _ = ctx.deregister_table(relation_id);
     ctx.register_table(relation_id.to_string(), provider)
         .map_err(|e| {
@@ -252,8 +257,7 @@ pub(crate) async fn handle_execute_relation(
                 }
                 DataFrameCacheAcquire::StartMaterialization(entry) => {
                     let result =
-                        materialize_dataframe_cache(ctx, &spark, query.clone(), &entry.relation_id)
-                            .await;
+                        materialize_dataframe_cache(ctx, &spark, query.clone(), &entry).await;
                     spark.finish_dataframe_cache_materialization(query, result.is_ok())?;
                     result?;
                 }

@@ -1,4 +1,5 @@
 pub mod array;
+pub mod cache;
 pub mod catalog;
 pub mod datasource;
 pub mod display;

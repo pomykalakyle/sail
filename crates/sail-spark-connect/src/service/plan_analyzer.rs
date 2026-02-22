@@ -43,6 +43,31 @@ fn default_data_frame_storage_level() -> spec::StorageLevel {
     }
 }
 
+fn validate_data_frame_storage_level(level: spec::StorageLevel) -> SparkResult<spec::StorageLevel> {
+    if !level.use_disk && !level.use_memory {
+        return Err(SparkError::invalid(
+            "storage level NONE is not supported by persist(); use unpersist() instead",
+        ));
+    }
+    if level.use_off_heap {
+        return Err(SparkError::unsupported(
+            "OFF_HEAP storage level is not supported for Spark Connect dataframe cache",
+        ));
+    }
+    if level.replication > 1 {
+        return Err(SparkError::unsupported(format!(
+            "replicated storage levels are not supported for Spark Connect dataframe cache: {}",
+            level.replication
+        )));
+    }
+    if level.use_disk && level.use_memory {
+        warn!(
+            "MEMORY_AND_DISK dataframe cache requested; Sail does not implement Spark's memory-first spill policy and uses a disk-backed cache implementation"
+        );
+    }
+    Ok(level)
+}
+
 fn none_data_frame_storage_level() -> StorageLevel {
     StorageLevel {
         use_disk: false,
@@ -205,6 +230,7 @@ pub(crate) async fn handle_analyze_persist(
         .map(|level| level.try_into())
         .transpose()?
         .unwrap_or_else(default_data_frame_storage_level);
+    let storage_level = validate_data_frame_storage_level(storage_level)?;
     let _ = spark.persist_dataframe_cache(&plan, storage_level)?;
     Ok(PersistResponse {})
 }
@@ -214,15 +240,17 @@ pub(crate) async fn handle_analyze_unpersist(
     request: UnpersistRequest,
 ) -> SparkResult<UnpersistResponse> {
     let spark = ctx.extension::<SparkSession>()?;
-    let UnpersistRequest {
-        relation,
-        blocking: _,
-    } = request;
+    let UnpersistRequest { relation, blocking } = request;
     let relation = relation.required("relation")?;
     let plan: spec::QueryPlan = relation.try_into()?;
     if let Some(entry) = spark.unpersist_dataframe_cache(&plan)? {
         // Best-effort cleanup. The cache map is authoritative.
         let _ = ctx.deregister_table(&entry.relation_id);
+    }
+    if blocking.unwrap_or(false) {
+        spark
+            .wait_for_dataframe_cache_materialization(&plan)
+            .await?;
     }
     Ok(UnpersistResponse {})
 }
@@ -256,7 +284,10 @@ pub(crate) async fn handle_analyze_json_to_ddl(
 mod tests {
     use std::collections::HashMap;
     use std::io::Cursor;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
+
 
     use datafusion::arrow::ipc::reader::StreamReader;
     use datafusion::arrow::record_batch::RecordBatch;
@@ -265,6 +296,7 @@ mod tests {
     use sail_common::config::AppConfig;
     use sail_common::runtime::{RuntimeHandle, RuntimeManager};
     use sail_common::spec;
+    use sail_common_datafusion::cache::IpcFileTableProvider;
     use sail_common_datafusion::extension::SessionExtensionAccessor;
 
     use crate::error::SparkResult;
@@ -460,6 +492,14 @@ mod tests {
                 .ok_or_else(|| crate::error::SparkError::internal("missing cache entry"))?;
             assert_eq!(entry.state, DataFrameCacheState::Materialized);
             assert_eq!(entry.materialization_count, 1);
+            let provider = context
+                .table_provider(entry.relation_id.as_str())
+                .await
+                .map_err(|e| crate::error::SparkError::internal(e.to_string()))?;
+            assert!(
+                provider.as_any().is::<IpcFileTableProvider>(),
+                "default MEMORY_AND_DISK cache should materialize to disk-backed provider"
+            );
             let first_hit_count = entry.hit_count;
             assert!(first_hit_count >= 1);
 
@@ -493,6 +533,167 @@ mod tests {
             assert!(spark.get_dataframe_cache_entry(&plan)?.is_none());
             Ok::<(), crate::error::SparkError>(())
         })?;
+        Ok(())
+    }
+    #[test]
+    fn test_persist_disk_only_materializes_to_disk_provider() -> SparkResult<()> {
+        let (handle, context) = create_test_context()?;
+        let relation = sql_relation("SELECT 1 AS x", 2602);
+        handle.primary().block_on(async {
+            let baseline_rows = count_rows(
+                execute_relation_and_collect_batches(&context, relation.clone())
+                    .await?
+                    .as_slice(),
+            );
+            let plan: spec::QueryPlan = relation.clone().try_into()?;
+            super::handle_analyze_persist(
+                &context,
+                PersistRequest {
+                    relation: Some(relation.clone()),
+                    storage_level: Some(ProtoStorageLevel {
+                        use_disk: true,
+                        use_memory: false,
+                        use_off_heap: false,
+                        deserialized: false,
+                        replication: 1,
+                    }),
+                },
+            )
+            .await?;
+
+            let persisted_rows = count_rows(
+                execute_relation_and_collect_batches(&context, relation.clone())
+                    .await?
+                    .as_slice(),
+            );
+            assert_eq!(persisted_rows, baseline_rows);
+
+            let spark = context.extension::<SparkSession>()?;
+            let entry = spark
+                .get_dataframe_cache_entry(&plan)?
+                .ok_or_else(|| crate::error::SparkError::internal("missing cache entry"))?;
+            assert_eq!(entry.state, DataFrameCacheState::Materialized);
+            let provider = context
+                .table_provider(entry.relation_id.as_str())
+                .await
+                .map_err(|e| crate::error::SparkError::internal(e.to_string()))?;
+            assert!(
+                provider.as_any().is::<IpcFileTableProvider>(),
+                "DISK_ONLY cache should materialize to IpcFileTableProvider"
+            );
+
+            super::handle_analyze_unpersist(
+                &context,
+                UnpersistRequest {
+                    relation: Some(relation),
+                    blocking: Some(false),
+                },
+            )
+            .await?;
+            Ok::<(), crate::error::SparkError>(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_persist_rejects_unsupported_storage_levels() -> SparkResult<()> {
+        let (handle, context) = create_test_context()?;
+        let relation = sql_relation("SELECT 1 AS x", 3003);
+        handle.primary().block_on(async {
+            let err = super::handle_analyze_persist(
+                &context,
+                PersistRequest {
+                    relation: Some(relation.clone()),
+                    storage_level: Some(ProtoStorageLevel {
+                        use_disk: true,
+                        use_memory: true,
+                        use_off_heap: true,
+                        deserialized: false,
+                        replication: 1,
+                    }),
+                },
+            )
+            .await
+            .expect_err("expected OFF_HEAP persist to be rejected");
+            assert!(matches!(err, crate::error::SparkError::NotSupported(_)));
+
+            let err = super::handle_analyze_persist(
+                &context,
+                PersistRequest {
+                    relation: Some(relation.clone()),
+                    storage_level: Some(ProtoStorageLevel {
+                        use_disk: true,
+                        use_memory: true,
+                        use_off_heap: false,
+                        deserialized: true,
+                        replication: 2,
+                    }),
+                },
+            )
+            .await
+            .expect_err("expected replicated persist to be rejected");
+            assert!(matches!(err, crate::error::SparkError::NotSupported(_)));
+            Ok::<(), crate::error::SparkError>(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_unpersist_blocking_waits_for_materialization() -> SparkResult<()> {
+        let (handle, context) = create_test_context()?;
+        let relation = sql_relation("SELECT 1 AS x", 4004);
+        let plan: spec::QueryPlan = relation.clone().try_into()?;
+        handle.primary().block_on(async {
+            super::handle_analyze_persist(
+                &context,
+                PersistRequest {
+                    relation: Some(relation.clone()),
+                    storage_level: None,
+                },
+            )
+            .await?;
+            let spark = context.extension::<SparkSession>()?;
+            let acquire = spark.acquire_dataframe_cache(&plan)?;
+            assert!(matches!(
+                acquire,
+                crate::session::DataFrameCacheAcquire::StartMaterialization(_)
+            ));
+            Ok::<(), crate::error::SparkError>(())
+        })?;
+
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_in_thread = finished.clone();
+        let relation_in_thread = relation.clone();
+        let context_in_thread = context.clone();
+        let handle_in_thread = handle.clone();
+        let join = std::thread::spawn(move || {
+            let result = handle_in_thread.primary().block_on(async {
+                super::handle_analyze_unpersist(
+                    &context_in_thread,
+                    UnpersistRequest {
+                        relation: Some(relation_in_thread),
+                        blocking: Some(true),
+                    },
+                )
+                .await
+            });
+            finished_in_thread.store(true, Ordering::SeqCst);
+            result
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!finished.load(Ordering::SeqCst));
+
+        handle.primary().block_on(async {
+            let spark = context.extension::<SparkSession>()?;
+            spark.finish_dataframe_cache_materialization(&plan, false)?;
+            Ok::<(), crate::error::SparkError>(())
+        })?;
+
+        join.join().map_err(|_| {
+            crate::error::SparkError::internal("blocking unpersist thread panicked")
+        })??;
+        assert!(finished.load(Ordering::SeqCst));
         Ok(())
     }
 }

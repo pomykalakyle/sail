@@ -9,6 +9,9 @@ use datafusion::physical_plan::collect;
 use datafusion::prelude::SessionContext;
 use datafusion_common::Constraints;
 use datafusion_expr::ScalarUDF;
+use log::warn;
+use sail_common::spec;
+use sail_common_datafusion::cache::create_ipc_file_table_provider;
 use sail_common_datafusion::catalog::{TableKind, TableStatus};
 use sail_common_datafusion::datasource::{SourceInfo, TableFormatRegistry};
 use sail_common_datafusion::extension::SessionExtensionAccessor;
@@ -80,6 +83,8 @@ pub enum CatalogCommand {
     },
     CacheTable {
         table: Vec<String>,
+        lazy: bool,
+        storage_level: Option<CatalogStorageLevel>,
     },
     UncacheTable {
         table: Vec<String>,
@@ -143,12 +148,63 @@ pub enum CatalogTableFunction {
     // PySpark UDTF is registered as a scalar UDF.
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Hash)]
+pub struct CatalogStorageLevel {
+    use_disk: bool,
+    use_memory: bool,
+    use_off_heap: bool,
+    deserialized: bool,
+    replication: usize,
+}
+
+impl From<spec::StorageLevel> for CatalogStorageLevel {
+    fn from(level: spec::StorageLevel) -> Self {
+        Self {
+            use_disk: level.use_disk,
+            use_memory: level.use_memory,
+            use_off_heap: level.use_off_heap,
+            deserialized: level.deserialized,
+            replication: level.replication,
+        }
+    }
+}
 fn cached_table_relation_id(cache_key: &str) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     cache_key.hash(&mut hasher);
     format!("__sail_cached_table_{:016x}", hasher.finish())
 }
 
+fn validate_table_cache_storage_level(level: Option<&CatalogStorageLevel>) -> CatalogResult<()> {
+    let Some(level) = level else {
+        return Ok(());
+    };
+    if !level.use_disk && !level.use_memory {
+        return Err(CatalogError::InvalidArgument(
+            "CACHE TABLE storage level must use disk and/or memory".to_string(),
+        ));
+    }
+    if level.use_off_heap {
+        warn!(
+            "CACHE TABLE requested OFF_HEAP storage; Sail does not support off-heap cache and ignores this flag"
+        );
+    }
+    if level.replication > 1 {
+        warn!(
+            "CACHE TABLE requested replication factor {}; replication is not supported",
+            level.replication
+        );
+    }
+    if level.use_disk && level.use_memory {
+        warn!(
+            "CACHE TABLE MEMORY_AND_DISK requested; Sail does not implement Spark's memory-first spill policy and uses a disk-backed cache implementation"
+        );
+    }
+    Ok(())
+}
+
+fn is_disk_backed_storage_level(level: Option<&CatalogStorageLevel>) -> bool {
+    matches!(level, Some(level) if level.use_disk)
+}
 async fn materialize_table_status_batches(
     ctx: &SessionContext,
     status: TableStatus,
@@ -249,12 +305,17 @@ async fn materialize_table_cache(
     ctx: &SessionContext,
     manager: &CatalogManager,
     table: &[String],
+    disk_backed: bool,
 ) -> CatalogResult<(String, Arc<dyn TableProvider>)> {
     let key = manager.cache_key_for_table(table).await?;
     let relation_id = cached_table_relation_id(&key);
     let status = manager.get_table_or_view(table).await?;
     let (schema, batches) = materialize_table_status_batches(ctx, status).await?;
-    let provider: Arc<dyn TableProvider> = Arc::new(MemTable::try_new(schema, vec![batches])?);
+    let provider: Arc<dyn TableProvider> = if disk_backed {
+        create_ipc_file_table_provider(relation_id.as_str(), schema, batches.as_slice())?
+    } else {
+        Arc::new(MemTable::try_new(schema, vec![batches])?)
+    };
     Ok((relation_id, provider))
 }
 
@@ -442,20 +503,28 @@ impl CatalogCommand {
                 let value = manager.is_cached_table(&table).await?;
                 display.bools().to_record_batch(vec![value])?
             }
-            CatalogCommand::CacheTable { table } => {
-                manager.cache_table(&table).await?;
-                let (relation_id, provider) =
-                    match materialize_table_cache(ctx, manager, &table).await {
-                        Ok(result) => result,
-                        Err(error) => {
-                            let _ = manager.uncache_table(&table, true).await;
-                            return Err(error);
-                        }
-                    };
-                manager
-                    .set_cached_table_relation(&table, relation_id.clone())
-                    .await?;
-                manager.set_cached_table_provider(relation_id, provider)?;
+            CatalogCommand::CacheTable {
+                table,
+                lazy,
+                storage_level,
+            } => {
+                validate_table_cache_storage_level(storage_level.as_ref())?;
+                let disk_backed = is_disk_backed_storage_level(storage_level.as_ref());
+                manager.cache_table(&table, lazy, disk_backed).await?;
+                if !lazy {
+                    let (relation_id, provider) =
+                        match materialize_table_cache(ctx, manager, &table, disk_backed).await {
+                            Ok(result) => result,
+                            Err(error) => {
+                                let _ = manager.uncache_table(&table, true).await;
+                                return Err(error);
+                            }
+                        };
+                    manager
+                        .set_cached_table_relation(&table, relation_id.clone())
+                        .await?;
+                    manager.set_cached_table_provider(relation_id, provider)?;
+                }
                 display.empty().to_record_batch(vec![])?
             }
             CatalogCommand::UncacheTable { table, if_exists } => {

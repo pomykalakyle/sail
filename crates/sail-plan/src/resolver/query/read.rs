@@ -1,14 +1,18 @@
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::Schema;
+use datafusion::catalog::MemTable;
 use datafusion::datasource::{provider_as_source, TableProvider};
-use datafusion_common::{DFSchema, TableReference};
+use datafusion::physical_plan::collect;
+use datafusion_common::{Constraints, DFSchema, TableReference};
 use datafusion_expr::registry::FunctionRegistry;
 use datafusion_expr::{LogicalPlan, TableScan, UNNAMED_TABLE};
 use sail_catalog::manager::CatalogManager;
 use sail_common::spec;
-use sail_common_datafusion::catalog::TableKind;
+use sail_common_datafusion::cache::create_ipc_file_table_provider;
+use sail_common_datafusion::catalog::{TableKind, TableStatus};
 use sail_common_datafusion::datasource::{SourceInfo, TableFormatRegistry};
 use sail_common_datafusion::extension::SessionExtensionAccessor;
 use sail_common_datafusion::rename::logical_plan::rename_logical_plan;
@@ -23,6 +27,74 @@ use crate::resolver::state::PlanResolverState;
 use crate::resolver::PlanResolver;
 
 impl PlanResolver<'_> {
+    fn cached_table_relation_id(cache_key: &str) -> String {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        cache_key.hash(&mut hasher);
+        format!("__sail_cached_table_{:016x}", hasher.finish())
+    }
+
+    async fn materialize_cached_table_provider(
+        &self,
+        status: TableStatus,
+        relation_id: &str,
+        disk_backed: bool,
+    ) -> PlanResult<Arc<dyn TableProvider>> {
+        let (schema, batches) = match status.kind {
+            TableKind::Table {
+                catalog: _,
+                database: _,
+                columns,
+                comment: _,
+                constraints: _,
+                format,
+                location,
+                partition_by,
+                sort_by,
+                bucket_by,
+                options,
+                properties: _,
+            } => {
+                let schema = Schema::new(columns.iter().map(|x| x.field()).collect::<Vec<_>>());
+                let info = SourceInfo {
+                    paths: location.map(|path| vec![path]).unwrap_or_default(),
+                    schema: Some(schema),
+                    constraints: Constraints::default(),
+                    partition_by,
+                    bucket_by: bucket_by.map(|value| value.into()),
+                    sort_order: sort_by.into_iter().map(|value| value.into()).collect(),
+                    options: vec![options.into_iter().collect()],
+                };
+                let registry = self.ctx.extension::<TableFormatRegistry>()?;
+                let provider = registry
+                    .get(&format)?
+                    .create_provider(&self.ctx.state(), info)
+                    .await?;
+                let filters = vec![];
+                let physical = provider
+                    .scan(&self.ctx.state(), None, filters.as_slice(), None)
+                    .await?;
+                let schema = physical.schema();
+                let batches = collect(physical, self.ctx.task_ctx()).await?;
+                (schema, batches)
+            }
+            TableKind::TemporaryView { plan, .. } | TableKind::GlobalTemporaryView { plan, .. } => {
+                let physical = self.ctx.state().create_physical_plan(plan.as_ref()).await?;
+                let schema = physical.schema();
+                let batches = collect(physical, self.ctx.task_ctx()).await?;
+                (schema, batches)
+            }
+            TableKind::View { .. } => {
+                return Err(PlanError::unsupported("cache view"));
+            }
+        };
+        let provider: Arc<dyn TableProvider> = if disk_backed {
+            create_ipc_file_table_provider(relation_id, schema, batches.as_slice())?
+        } else {
+            Arc::new(MemTable::try_new(schema, vec![batches])?)
+        };
+        Ok(provider)
+    }
+
     pub(super) async fn resolve_query_read_named_table(
         &self,
         table: spec::ReadNamedTable,
@@ -70,6 +142,27 @@ impl PlanResolver<'_> {
                     state,
                 );
             }
+        }
+        if manager.is_cached_table(&reference).await? {
+            let cache_key = manager.cache_key_for_table(&reference).await?;
+            let relation_id = Self::cached_table_relation_id(cache_key.as_str());
+            let disk_backed = manager.is_disk_cached_table(&reference).await?;
+            let status = manager.get_table_or_view(&reference).await?;
+            let provider = self
+                .materialize_cached_table_provider(status, relation_id.as_str(), disk_backed)
+                .await?;
+            manager
+                .set_cached_table_relation(&reference, relation_id.clone())
+                .await?;
+            manager.set_cached_table_provider(relation_id, provider.clone())?;
+            return self.resolve_table_provider_with_rename(
+                provider,
+                table_reference,
+                None,
+                vec![],
+                None,
+                state,
+            );
         }
 
         let status = manager.get_table_or_view(&reference).await?;

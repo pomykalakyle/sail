@@ -159,15 +159,19 @@ impl PlanResolver<'_> {
             }
             CommandNode::CacheTable {
                 table,
-                lazy: _,
-                storage_level: _,
+                lazy,
+                storage_level,
                 query,
             } => {
                 if query.is_some() {
-                    Err(PlanError::todo("PlanNode::CacheTable with query"))
+                    Err(PlanError::unsupported(
+                        "CACHE TABLE AS SELECT is not supported",
+                    ))
                 } else {
                     self.resolve_catalog_command(CatalogCommand::CacheTable {
                         table: table.into(),
+                        lazy,
+                        storage_level: storage_level.map(|level| level.into()),
                     })
                 }
             }
