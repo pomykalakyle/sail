@@ -1794,6 +1794,9 @@ mod tests {
     use sail_sql_analyzer::statement::from_ast_statement;
 
     use crate::error::{SparkError, SparkResult};
+    use crate::spark::connect::relation::RelType;
+    use crate::spark::connect::{CachedRemoteRelation, Relation, RelationCommon};
+
 
     #[test]
     fn test_sql_to_plan() -> SparkResult<()> {
@@ -1802,5 +1805,33 @@ mod tests {
             |sql: String| Ok(from_ast_statement(parse_one_statement(&sql)?)?),
             SparkError::internal,
         )
+    }
+
+    #[test]
+    fn test_cached_remote_relation_to_query_plan() -> SparkResult<()> {
+        let relation = Relation {
+            common: Some(RelationCommon {
+                #[allow(deprecated)]
+                source_info: String::new(),
+                plan_id: Some(42),
+                origin: None,
+            }),
+            rel_type: Some(RelType::CachedRemoteRelation(CachedRemoteRelation {
+                relation_id: "__sail_cached_remote_relation_42".to_string(),
+            })),
+        };
+        let plan: sail_common::spec::QueryPlan = relation.try_into()?;
+        assert_eq!(plan.plan_id, Some(42));
+        match plan.node {
+            sail_common::spec::QueryNode::CachedRemoteRelation { relation_id } => {
+                assert_eq!(relation_id, "__sail_cached_remote_relation_42".to_string())
+            }
+            other => {
+                return Err(SparkError::internal(format!(
+                    "expected cached remote relation, got: {other:?}"
+                )));
+            }
+        }
+        Ok(())
     }
 }

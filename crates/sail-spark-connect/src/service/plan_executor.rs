@@ -1,7 +1,9 @@
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use datafusion::arrow::compute::concat_batches;
+use datafusion::catalog::{MemTable, MemoryCatalogProvider, MemorySchemaProvider};
 use datafusion::prelude::SessionContext;
 use fastrace::collector::SpanContext;
 use fastrace::future::FutureExt;
@@ -9,6 +11,7 @@ use fastrace::Span;
 use futures::stream;
 use log::{debug, warn};
 use sail_common::spec;
+use sail_common_datafusion::cache::create_ipc_file_table_provider;
 use sail_common_datafusion::extension::SessionExtensionAccessor;
 use sail_common_datafusion::session::JobService;
 use sail_plan::resolve_and_execute_plan;
@@ -21,17 +24,19 @@ use crate::executor::{
     read_stream, to_arrow_batch, Executor, ExecutorBatch, ExecutorMetadata, ExecutorOutput,
     ExecutorOutputStream,
 };
-use crate::session::SparkSession;
+use crate::session::{
+    DataFrameCacheAcquire, SparkSession, DATAFRAME_CACHE_CATALOG, DATAFRAME_CACHE_SCHEMA,
+};
 use crate::spark::connect::execute_plan_response::{
     ResponseType, ResultComplete, SqlCommandResult,
 };
 use crate::spark::connect::{
     relation, CheckpointCommand, CheckpointCommandResult, CommonInlineUserDefinedFunction,
     CommonInlineUserDefinedTableFunction, CreateDataFrameViewCommand, ExecutePlanResponse,
-    GetResourcesCommand, LocalRelation, Relation, SqlCommand, StreamingQueryCommand,
-    StreamingQueryCommandResult, StreamingQueryListenerBusCommand, StreamingQueryManagerCommand,
-    StreamingQueryManagerCommandResult, WriteOperation, WriteOperationV2,
-    WriteStreamOperationStart, WriteStreamOperationStartResult,
+    GetResourcesCommand, LocalRelation, Relation, RemoveCachedRemoteRelationCommand, SqlCommand,
+    StreamingQueryCommand, StreamingQueryCommandResult, StreamingQueryListenerBusCommand,
+    StreamingQueryManagerCommand, StreamingQueryManagerCommandResult, WriteOperation,
+    WriteOperationV2, WriteStreamOperationStart, WriteStreamOperationStartResult,
 };
 use crate::streaming::timeout_millis;
 
@@ -158,12 +163,107 @@ async fn handle_execute_plan(
     ))
 }
 
+fn to_cached_remote_relation_plan(query: &spec::QueryPlan, relation_id: String) -> spec::Plan {
+    spec::Plan::Query(spec::QueryPlan {
+        node: spec::QueryNode::CachedRemoteRelation { relation_id },
+        plan_id: query.plan_id,
+    })
+}
+
+fn ensure_dataframe_cache_namespace(ctx: &SessionContext) -> SparkResult<()> {
+    let catalog = if let Some(catalog) = ctx.catalog(DATAFRAME_CACHE_CATALOG) {
+        catalog
+    } else {
+        let catalog = Arc::new(MemoryCatalogProvider::new());
+        ctx.register_catalog(DATAFRAME_CACHE_CATALOG, catalog.clone());
+        catalog
+    };
+    if catalog.schema(DATAFRAME_CACHE_SCHEMA).is_none() {
+        catalog.register_schema(
+            DATAFRAME_CACHE_SCHEMA,
+            Arc::new(MemorySchemaProvider::new()),
+        )?;
+    }
+    Ok(())
+}
+
+async fn materialize_dataframe_cache(
+    ctx: &SessionContext,
+    spark: &SparkSession,
+    query: spec::QueryPlan,
+    entry: &crate::session::DataFrameCacheEntry,
+) -> SparkResult<()> {
+    let relation_id = &entry.relation_id;
+    ensure_dataframe_cache_namespace(ctx)?;
+    let service = ctx.extension::<JobService>()?;
+    let (plan, _) =
+        resolve_and_execute_plan(ctx, spark.plan_config()?, spec::Plan::Query(query.clone()))
+            .await?;
+    let stream = service.runner().execute(ctx, plan).await?;
+    let schema = stream.schema();
+    let batches = read_stream(stream).await?;
+    // If the relation was unpersisted while we were computing, skip publication.
+    if !spark.should_publish_dataframe_cache(&query, relation_id)? {
+        debug!(
+            "skipping dataframe cache publication for '{}': relation is no longer persisted",
+            relation_id
+        );
+        return Ok(());
+    }
+    let provider = if entry.storage_level.use_disk {
+        create_ipc_file_table_provider(relation_id.as_str(), schema, batches.as_slice())?
+    } else {
+        Arc::new(MemTable::try_new(schema, vec![batches])?)
+    };
+    let _ = ctx.deregister_table(relation_id);
+    ctx.register_table(relation_id.to_string(), provider)
+        .map_err(|e| {
+            crate::error::SparkError::internal(format!(
+                "failed to register dataframe cache table '{relation_id}': {e}"
+            ))
+        })?;
+    // Unpersist can race between the validation above and registration; clean up eagerly.
+    if !spark.should_publish_dataframe_cache(&query, relation_id)? {
+        let _ = ctx.deregister_table(relation_id);
+    }
+    Ok(())
+}
+
 pub(crate) async fn handle_execute_relation(
     ctx: &SessionContext,
     relation: Relation,
     metadata: ExecutorMetadata,
 ) -> SparkResult<ExecutePlanResponseStream> {
-    let plan = relation.try_into()?;
+    let spark = ctx.extension::<SparkSession>()?;
+    let plan: spec::Plan = relation.try_into()?;
+    if let spec::Plan::Query(query) = &plan {
+        loop {
+            match spark.acquire_dataframe_cache(query)? {
+                DataFrameCacheAcquire::NotPersisted => break,
+                DataFrameCacheAcquire::Ready(entry) => {
+                    debug!("using dataframe cache '{}'", entry.relation_id);
+                    spark.record_dataframe_cache_hit(query)?;
+                    let plan = to_cached_remote_relation_plan(query, entry.relation_id);
+                    return handle_execute_plan(ctx, plan, metadata, ExecutePlanMode::Lazy).await;
+                }
+                DataFrameCacheAcquire::InProgress(notifier) => {
+                    // Avoid racing with cache publication: only wait if the cache is still
+                    // materializing after we subscribe to notifications.
+                    let notified = notifier.notified();
+                    if !spark.is_dataframe_cache_materializing(query)? {
+                        continue;
+                    }
+                    notified.await;
+                }
+                DataFrameCacheAcquire::StartMaterialization(entry) => {
+                    let result =
+                        materialize_dataframe_cache(ctx, &spark, query.clone(), &entry).await;
+                    spark.finish_dataframe_cache_materialization(query, result.is_ok())?;
+                    result?;
+                }
+            }
+        }
+    }
     handle_execute_plan(ctx, plan, metadata, ExecutePlanMode::Lazy).await
 }
 
@@ -500,6 +600,29 @@ pub(crate) async fn handle_execute_streaming_query_listener_bus_command(
 ) -> SparkResult<ExecutePlanResponseStream> {
     Err(SparkError::NotImplemented(
         "streaming query listener bus".to_string(),
+    ))
+}
+
+pub(crate) async fn handle_execute_remove_cached_remote_relation_command(
+    ctx: &SessionContext,
+    command: RemoveCachedRemoteRelationCommand,
+    metadata: ExecutorMetadata,
+) -> SparkResult<ExecutePlanResponseStream> {
+    let spark = ctx.extension::<SparkSession>()?;
+    let RemoveCachedRemoteRelationCommand { relation } = command;
+    let relation = relation.required("cached remote relation")?;
+    if !relation.relation_id.is_empty() {
+        let _ = spark.unpersist_dataframe_cache_by_relation_id(&relation.relation_id)?;
+        let _ = ctx.deregister_table(&relation.relation_id);
+    }
+    let mut output = vec![];
+    if metadata.reattachable {
+        output.push(ExecutorOutput::complete());
+    }
+    Ok(ExecutePlanResponseStream::new(
+        spark.session_id().to_string(),
+        metadata.operation_id,
+        Box::pin(stream::iter(output)),
     ))
 }
 
