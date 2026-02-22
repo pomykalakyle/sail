@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Debug;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::StringifiedPlan;
 use sail_common::datetime::get_system_timezone;
+use sail_common::spec;
 use sail_common_datafusion::extension::SessionExtension;
 use sail_plan::config::PlanConfig;
 use sail_session::session_manager::SessionKey;
@@ -34,9 +36,40 @@ impl fmt::Display for SparkSessionKey {
 
 impl SessionKey for SparkSessionKey {}
 
+pub(crate) const DATAFRAME_CACHE_CATALOG: &str = "__sail_internal";
+pub(crate) const DATAFRAME_CACHE_SCHEMA: &str = "__spark_connect_cache";
+
 #[derive(Debug, Clone)]
 pub(crate) struct SparkSessionOptions {
     pub execution_heartbeat_interval: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum DataFrameCacheKey {
+    PlanId(i64),
+    PlanJson(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DataFrameCacheState {
+    Pending,
+    Materializing,
+    Materialized,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DataFrameCacheEntry {
+    pub relation_id: String,
+    pub storage_level: spec::StorageLevel,
+    pub state: DataFrameCacheState,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum DataFrameCacheAcquire {
+    NotPersisted,
+    Ready(DataFrameCacheEntry),
+    InProgress,
+    StartMaterialization(DataFrameCacheEntry),
 }
 
 /// A Spark session extension to the DataFusion [`SessionContext`].
@@ -66,6 +99,26 @@ impl SessionExtension for SparkSession {
 }
 
 impl SparkSession {
+    fn cache_key_for_query_plan(plan: &spec::QueryPlan) -> SparkResult<DataFrameCacheKey> {
+        if let Some(plan_id) = plan.plan_id {
+            Ok(DataFrameCacheKey::PlanId(plan_id))
+        } else {
+            Ok(DataFrameCacheKey::PlanJson(serde_json::to_string(plan)?))
+        }
+    }
+
+    fn relation_id_for_cache_key(key: &DataFrameCacheKey) -> String {
+        let table = match key {
+            DataFrameCacheKey::PlanId(id) => format!("__sail_cached_remote_relation_{id}"),
+            DataFrameCacheKey::PlanJson(value) => {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                value.hash(&mut hasher);
+                format!("__sail_cached_remote_relation_{:016x}", hasher.finish())
+            }
+        };
+        format!("{DATAFRAME_CACHE_CATALOG}.{DATAFRAME_CACHE_SCHEMA}.{table}")
+    }
+
     pub(crate) fn try_new(
         user_id: String,
         session_id: String,
@@ -217,6 +270,101 @@ impl SparkSession {
         Ok(removed)
     }
 
+    pub(crate) fn persist_dataframe_cache(
+        &self,
+        plan: &spec::QueryPlan,
+        storage_level: spec::StorageLevel,
+    ) -> SparkResult<DataFrameCacheEntry> {
+        let key = Self::cache_key_for_query_plan(plan)?;
+        let mut state = self.state.lock()?;
+        let relation_id = state
+            .dataframe_cache
+            .get(&key)
+            .map(|entry| entry.relation_id.clone())
+            .unwrap_or_else(|| Self::relation_id_for_cache_key(&key));
+        let cache_state = state
+            .dataframe_cache
+            .get(&key)
+            .map(|entry| entry.state)
+            .unwrap_or(DataFrameCacheState::Pending);
+        let entry = DataFrameCacheEntry {
+            relation_id,
+            storage_level,
+            state: cache_state,
+        };
+        state.dataframe_cache.insert(key, entry.clone());
+        Ok(entry)
+    }
+
+    pub(crate) fn unpersist_dataframe_cache(
+        &self,
+        plan: &spec::QueryPlan,
+    ) -> SparkResult<Option<DataFrameCacheEntry>> {
+        let key = Self::cache_key_for_query_plan(plan)?;
+        let mut state = self.state.lock()?;
+        Ok(state.dataframe_cache.remove(&key))
+    }
+
+    pub(crate) fn unpersist_dataframe_cache_by_relation_id(
+        &self,
+        relation_id: &str,
+    ) -> SparkResult<bool> {
+        let mut state = self.state.lock()?;
+        let previous_len = state.dataframe_cache.len();
+        state
+            .dataframe_cache
+            .retain(|_, entry| entry.relation_id != relation_id);
+        Ok(state.dataframe_cache.len() != previous_len)
+    }
+
+    pub(crate) fn get_dataframe_cache_storage_level(
+        &self,
+        plan: &spec::QueryPlan,
+    ) -> SparkResult<Option<spec::StorageLevel>> {
+        let key = Self::cache_key_for_query_plan(plan)?;
+        let state = self.state.lock()?;
+        Ok(state
+            .dataframe_cache
+            .get(&key)
+            .map(|entry| entry.storage_level.clone()))
+    }
+
+    pub(crate) fn acquire_dataframe_cache(
+        &self,
+        plan: &spec::QueryPlan,
+    ) -> SparkResult<DataFrameCacheAcquire> {
+        let key = Self::cache_key_for_query_plan(plan)?;
+        let mut state = self.state.lock()?;
+        let Some(entry) = state.dataframe_cache.get_mut(&key) else {
+            return Ok(DataFrameCacheAcquire::NotPersisted);
+        };
+        match entry.state {
+            DataFrameCacheState::Pending => {
+                entry.state = DataFrameCacheState::Materializing;
+                Ok(DataFrameCacheAcquire::StartMaterialization(entry.clone()))
+            }
+            DataFrameCacheState::Materializing => Ok(DataFrameCacheAcquire::InProgress),
+            DataFrameCacheState::Materialized => Ok(DataFrameCacheAcquire::Ready(entry.clone())),
+        }
+    }
+
+    pub(crate) fn finish_dataframe_cache_materialization(
+        &self,
+        plan: &spec::QueryPlan,
+        success: bool,
+    ) -> SparkResult<()> {
+        let key = Self::cache_key_for_query_plan(plan)?;
+        let mut state = self.state.lock()?;
+        if let Some(entry) = state.dataframe_cache.get_mut(&key) {
+            entry.state = if success {
+                DataFrameCacheState::Materialized
+            } else {
+                DataFrameCacheState::Pending
+            };
+        }
+        Ok(())
+    }
+
     pub(crate) fn start_streaming_query(
         &self,
         name: String,
@@ -309,6 +457,7 @@ impl SparkSession {
 struct SparkSessionState {
     config: SparkRuntimeConfig,
     executors: HashMap<String, Arc<Executor>>,
+    dataframe_cache: HashMap<DataFrameCacheKey, DataFrameCacheEntry>,
     streaming_queries: StreamingQueryManager,
 }
 
@@ -317,6 +466,7 @@ impl SparkSessionState {
         Self {
             config: SparkRuntimeConfig::new(),
             executors: HashMap::new(),
+            dataframe_cache: HashMap::new(),
             streaming_queries: StreamingQueryManager::new(),
         }
     }

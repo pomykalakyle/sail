@@ -15,6 +15,23 @@ use crate::resolver::state::PlanResolverState;
 use crate::resolver::PlanResolver;
 
 impl PlanResolver<'_> {
+    pub(super) async fn resolve_query_cached_remote_relation(
+        &self,
+        relation_id: String,
+        state: &mut PlanResolverState,
+    ) -> PlanResult<LogicalPlan> {
+        let table_provider = self.ctx.table_provider(relation_id.as_str()).await?;
+        self.resolve_table_provider_with_rename(
+            table_provider,
+            relation_id,
+            None,
+            vec![],
+            None,
+            state,
+        )
+    }
+
+    /// Resolves a query plan that produces an empty relation.
     /// Resolves a query plan that produces an empty relation.
     /// When `produce_one_row` is true, it can be used for literal projection with no input.
     pub(super) fn resolve_query_empty(&self, produce_one_row: bool) -> PlanResult<LogicalPlan> {
