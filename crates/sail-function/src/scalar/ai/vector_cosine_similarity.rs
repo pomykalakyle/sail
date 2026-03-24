@@ -4,7 +4,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Array, ArrayRef, Float64Array};
 use datafusion::arrow::datatypes::DataType;
 use datafusion_common::cast::as_float64_array;
-use datafusion_common::{exec_err, Result, ScalarValue};
+use datafusion_common::{exec_err, plan_err, Result, ScalarValue};
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
 
 use crate::scalar::map::utils::{get_list_offsets, get_list_values};
@@ -45,6 +45,28 @@ impl ScalarUDFImpl for VectorCosineSimilarity {
 
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         Ok(DataType::Float64)
+    }
+
+    fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
+        if arg_types.len() != 2 {
+            return exec_err!(
+                "Spark `vector_cosine_similarity` function requires 2 arguments, got {}",
+                arg_types.len()
+            );
+        }
+
+        let coerced = arg_types
+            .iter()
+            .map(coerce_vector_type)
+            .collect::<Result<Vec<_>>>()?;
+        let left = &coerced[0];
+        let right = &coerced[1];
+
+        let left_element = list_element_type(left)?;
+        let right_element = list_element_type(right)?;
+        let element_type = common_numeric_type(left_element, right_element)?;
+        let target = list_type_like(left, element_type)?;
+        Ok(vec![target; 2])
     }
 
     fn aliases(&self) -> &[String] {
@@ -166,6 +188,61 @@ fn cast_list_values_to_f64(array: &ArrayRef) -> Result<ArrayRef> {
         }
     };
     Ok(values)
+}
+
+fn coerce_vector_type(data_type: &DataType) -> Result<DataType> {
+    match data_type {
+        DataType::Null => Ok(DataType::List(Arc::new(
+            datafusion::arrow::datatypes::Field::new_list_field(DataType::Float64, true),
+        ))),
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
+            Ok(data_type.clone())
+        }
+        other => exec_err!(
+            "Spark `vector_cosine_similarity` function requires ARRAY arguments, got {other}"
+        ),
+    }
+}
+
+fn list_element_type(data_type: &DataType) -> Result<&DataType> {
+    match data_type {
+        DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _) => {
+            Ok(field.data_type())
+        }
+        other => plan_err!("Expected list type for vector similarity coercion, got {other}"),
+    }
+}
+
+fn common_numeric_type(left: &DataType, right: &DataType) -> Result<DataType> {
+    if left == &DataType::Null {
+        return Ok(right.clone());
+    }
+    if right == &DataType::Null {
+        return Ok(left.clone());
+    }
+    if !left.is_numeric() || !right.is_numeric() {
+        return exec_err!(
+            "Spark `vector_cosine_similarity` function requires numeric array elements, got {left} and {right}"
+        );
+    }
+    if left.is_floating() || right.is_floating() {
+        Ok(DataType::Float64)
+    } else {
+        Ok(DataType::Float64)
+    }
+}
+
+fn list_type_like(template: &DataType, element_type: DataType) -> Result<DataType> {
+    let field = Arc::new(datafusion::arrow::datatypes::Field::new_list_field(
+        element_type,
+        true,
+    ));
+    match template {
+        DataType::List(_) => Ok(DataType::List(field)),
+        DataType::LargeList(_) => Ok(DataType::LargeList(field)),
+        DataType::FixedSizeList(_, size) => Ok(DataType::FixedSizeList(field, *size)),
+        other => plan_err!("Expected list type for vector similarity coercion, got {other}"),
+    }
 }
 
 fn offset_range(offsets: &[i32], row: usize) -> (usize, usize) {
