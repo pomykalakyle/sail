@@ -287,8 +287,8 @@ fn rewrite_stage_boundary(
         }
     } else if plan.as_any().is::<SortPreservingMergeExec>() {
         let child = plan.children().one()?;
-        plan.clone()
-            .with_new_children(vec![create_merge_input(child, graph)?])?
+        Ok(plan.clone()
+            .with_new_children(vec![create_merge_input(child, graph)?])?)
     } else if plan.as_any().is::<SystemTableExec>() || plan.as_any().is::<CatalogCommandExec>() {
         plan.children().zero()?;
         create_driver_stage(&plan, graph)

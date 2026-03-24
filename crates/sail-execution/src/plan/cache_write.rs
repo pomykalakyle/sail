@@ -157,11 +157,9 @@ impl ExecutionPlan for CacheWriteExec {
         let cache_reporter = self.cache_reporter.clone();
 
         let output = futures::stream::once(async move {
-            let mut batches = Vec::new();
             while let Some(batch) = stream.next().await {
-                batches.push(batch?);
+                cache_store.store_individual(cache_id, partition, batch?);
             }
-            cache_store.store(cache_id, partition, batches);
             if let Some(reporter) = cache_reporter {
                 reporter.report_partition_stored(cache_id, partition);
             }
