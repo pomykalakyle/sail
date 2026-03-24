@@ -6176,13 +6176,17 @@ dependencies = [
  "rand_chacha 0.10.0",
  "rand_distr",
  "regex",
+ "reqwest",
  "sail-common",
  "sail-common-datafusion",
  "sail-sql-analyzer",
+ "serde",
  "serde_json",
  "thiserror",
+ "tokio",
  "twox-hash",
  "url",
+ "wiremock",
 ]
 
 [[package]]
