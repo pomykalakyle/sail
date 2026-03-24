@@ -17,6 +17,7 @@ use datafusion::physical_plan::{
 use sail_catalog_system::physical_plan::SystemTableExec;
 use sail_common::cache_id::CacheId;
 use sail_common_datafusion::utils::items::ItemTaker;
+use sail_physical_plan::catalog_command::CatalogCommandExec;
 
 use crate::error::{ExecutionError, ExecutionResult};
 use crate::job_graph::{
@@ -224,10 +225,12 @@ fn build_job_graph(
             build_job_graph(left.clone(), PartitionUsage::Shared, graph)?,
             build_job_graph(right.clone(), usage, graph)?,
         ]
-    } else if plan.as_any().is::<RepartitionExec>() || plan.as_any().is::<CoalescePartitionsExec>()
+    } else if plan.as_any().is::<RepartitionExec>()
+        || plan.as_any().is::<CoalescePartitionsExec>()
+        || plan.as_any().is::<SortPreservingMergeExec>()
     {
         let child = plan.children().one()?;
-        // At the shuffle boundary, we only expect to use the child partition once
+        // At the stage boundary, we only expect to use the child partition once
         // since the shuffle writer can materialize the data for multiple consumption.
         vec![build_job_graph(child.clone(), PartitionUsage::Once, graph)?]
     } else {
@@ -284,10 +287,9 @@ fn rewrite_stage_boundary(
         }
     } else if plan.as_any().is::<SortPreservingMergeExec>() {
         let child = plan.children().one()?;
-        Ok(plan
-            .clone()
-            .with_new_children(vec![create_merge_input(child, graph)?])?)
-    } else if plan.as_any().is::<SystemTableExec>() {
+        plan.clone()
+            .with_new_children(vec![create_merge_input(child, graph)?])?
+    } else if plan.as_any().is::<SystemTableExec>() || plan.as_any().is::<CatalogCommandExec>() {
         plan.children().zero()?;
         create_driver_stage(&plan, graph)
     } else {

@@ -5,7 +5,8 @@ from pandas.testing import assert_frame_equal
 from pyspark.sql.types import Row
 from pyspark.sql.window import Window
 
-from pysail.tests.spark.utils import is_jvm_spark
+from pysail.spark import SparkConnectServer
+from pysail.testing.spark.utils.common import is_jvm_spark
 
 
 @pytest.fixture(scope="module")
