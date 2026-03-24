@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod array;
 pub mod collection;
 pub mod csv;

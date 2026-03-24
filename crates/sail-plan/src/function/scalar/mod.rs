@@ -1,5 +1,6 @@
 use crate::function::common::ScalarFunction;
 
+mod ai;
 mod array;
 mod bitwise;
 mod collection;
@@ -23,6 +24,7 @@ mod xml;
 
 pub(super) fn list_built_in_scalar_functions() -> Vec<(&'static str, ScalarFunction)> {
     let mut output = Vec::new();
+    output.extend(ai::list_built_in_ai_functions());
     output.extend(array::list_built_in_array_functions());
     output.extend(bitwise::list_built_in_bitwise_functions());
     output.extend(collection::list_built_in_collection_functions());
