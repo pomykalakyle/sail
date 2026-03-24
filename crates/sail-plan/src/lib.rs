@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use async_recursion::async_recursion;
 use datafusion::dataframe::DataFrame;
 use datafusion::physical_plan::{displayable, ExecutionPlan};
 use datafusion::prelude::SessionContext;
@@ -11,9 +10,7 @@ use sail_cache_manager::CacheManager;
 use sail_common::spec;
 use sail_common_datafusion::extension::SessionExtensionAccessor;
 use sail_common_datafusion::rename::physical_plan::rename_physical_plan;
-use sail_logical_plan::precondition::WithPreconditionsNode;
 
-use crate::catalog::CatalogCommandNode;
 use crate::config::PlanConfig;
 use crate::error::PlanResult;
 use crate::resolver::plan::NamedPlan;
@@ -30,25 +27,8 @@ pub mod resolver;
 mod streaming;
 
 /// Executes a logical plan.
-/// This replaces DDL statements and catalog operations with the execution results.
-/// Logical plan nodes with corresponding physical plan nodes remain unchanged.
-#[async_recursion]
+/// Catalog commands and barrier nodes are handled by the physical planner.
 pub async fn execute_logical_plan(ctx: &SessionContext, plan: LogicalPlan) -> Result<DataFrame> {
-    let plan = match plan {
-        LogicalPlan::Extension(Extension { node }) => {
-            if let Some(n) = node.as_any().downcast_ref::<CatalogCommandNode>() {
-                n.execute(ctx).await?
-            } else if let Some(n) = node.as_any().downcast_ref::<WithPreconditionsNode>() {
-                for plan in n.preconditions() {
-                    let _ = execute_logical_plan(ctx, plan.as_ref().clone()).await?;
-                }
-                n.plan().clone()
-            } else {
-                LogicalPlan::Extension(Extension { node })
-            }
-        }
-        x => x,
-    };
     let df = ctx.execute_logical_plan(plan).await?;
     Ok(df)
 }
