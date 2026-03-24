@@ -17,11 +17,12 @@ impl LocalCacheStore {
         }
     }
 
-    /// Stores RecordBatches for a given cache ID and partition.
-    pub fn store(&self, cache_id: CacheId, partition: usize, batches: Vec<RecordBatch>) {
+    /// Stores indidividual RecordBatches for a given cache ID and partition
+    pub fn store_individual(&self, cache_id: CacheId, partition: usize, batch: RecordBatch) {
         let mut data = self.data.lock().unwrap_or_else(|e| e.into_inner());
-        data.insert((cache_id, partition), batches);
-    }
+        data.entry((cache_id, partition)).or_insert_with(Vec::new).push(batch);
+      
+   }
 
     /// Retrieves cloned RecordBatches for a given cache ID and partition.
     pub fn get(&self, cache_id: CacheId, partition: usize) -> Option<Vec<RecordBatch>> {

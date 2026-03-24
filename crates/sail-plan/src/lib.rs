@@ -5,11 +5,11 @@ use datafusion::physical_plan::{displayable, ExecutionPlan};
 use datafusion::prelude::SessionContext;
 use datafusion_common::display::{PlanType, StringifiedPlan, ToStringifiedPlan};
 use datafusion_common::Result;
-use datafusion_expr::{Extension, LogicalPlan};
 use sail_cache_manager::CacheManager;
 use sail_common::spec;
 use sail_common_datafusion::extension::SessionExtensionAccessor;
 use sail_common_datafusion::rename::physical_plan::rename_physical_plan;
+use datafusion_expr::LogicalPlan;
 
 use crate::config::PlanConfig;
 use crate::error::PlanResult;

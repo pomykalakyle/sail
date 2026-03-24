@@ -21,6 +21,8 @@ pub struct CachedData {
 }
 
 /// Manages cached query results for a session.
+// TODO: Replace `Mutex<SlotMap>` with `moka::sync::Cache` for automatic eviction,
+// TTL support, and lock-free concurrent access.
 pub struct CacheManager {
     entries: Mutex<SlotMap<CacheId, CachedData>>,
 }
