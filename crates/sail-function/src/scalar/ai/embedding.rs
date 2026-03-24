@@ -20,11 +20,6 @@ const SMALL_MODEL: &str = "text-embedding-3-small";
 const LARGE_MODEL: &str = "text-embedding-3-large";
 const SMALL_DIMENSIONS: i32 = 512;
 const LARGE_DIMENSIONS: i32 = 1024;
-const OPENAI_BASE_URL_ENV: &str = "SAIL_EMBEDDING_BASE_URL";
-const OPENAI_API_KEY_ENV: &str = "SAIL_EMBEDDING_API_KEY";
-const OPENAI_MODEL_ENV: &str = "SAIL_EMBEDDING_MODEL";
-const OPENAI_DIMENSIONS_ENV: &str = "SAIL_EMBEDDING_DIMENSIONS";
-const OPENAI_TIMEOUT_MS_ENV: &str = "SAIL_EMBEDDING_TIMEOUT_MS";
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TEXT_CHARS: usize = 2_048;
@@ -68,8 +63,7 @@ impl ScalarUDFImpl for Embedding {
     }
 
     fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
-        let model = scalar_string_argument(args.scalar_arguments, 1)?
-            .or_else(|| std::env::var(OPENAI_MODEL_ENV).ok());
+        let model = scalar_string_argument(args.scalar_arguments, 2)?;
         let dimensions = dimensions_for_model(model.as_deref())?;
         Ok(Arc::new(Field::new(
             Self::NAME,
@@ -78,11 +72,48 @@ impl ScalarUDFImpl for Embedding {
         )))
     }
 
+    fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
+        if !(2..=3).contains(&arg_types.len()) {
+            return exec_err!(
+                "Spark `embedding` function requires 2 or 3 arguments, got {}",
+                arg_types.len()
+            );
+        }
+
+        let mut coerced = Vec::with_capacity(arg_types.len());
+        for (index, arg_type) in arg_types.iter().enumerate() {
+            let is_string_like = matches!(
+                arg_type,
+                DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8
+            );
+            let is_nullable_model = index == 2 && matches!(arg_type, DataType::Null);
+            let is_nullable_text_or_token = index < 2 && matches!(arg_type, DataType::Null);
+            if is_string_like || is_nullable_model || is_nullable_text_or_token {
+                coerced.push(if matches!(arg_type, DataType::LargeUtf8) {
+                    DataType::LargeUtf8
+                } else {
+                    DataType::Utf8
+                });
+            } else {
+                let argument_name = match index {
+                    0 => "text",
+                    1 => "api token",
+                    2 => "model",
+                    _ => "unknown",
+                };
+                return exec_err!(
+                    "Spark `embedding` function: {argument_name} argument must be STRING, got {arg_type:?}"
+                );
+            }
+        }
+        Ok(coerced)
+    }
+
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let ScalarFunctionArgs { args, .. } = args;
-        if !(1..=2).contains(&args.len()) {
+        if !(2..=3).contains(&args.len()) {
             return exec_err!(
-                "Spark `embedding` function requires 1 or 2 arguments, got {}",
+                "Spark `embedding` function requires 2 or 3 arguments, got {}",
                 args.len()
             );
         }
@@ -120,15 +151,31 @@ fn dimensions_for_model(model: Option<&str>) -> Result<i32> {
 
 fn embedding_inner(args: &[ArrayRef]) -> Result<ArrayRef> {
     let text_values = collect_string_values(&args[0])?;
+    let api_key = required_scalar_string_from_array(&args[1], "api token")?;
 
-    let model = if args.len() == 2 {
-        scalar_string_from_array(&args[1])?.unwrap_or_else(|| DEFAULT_MODEL.to_string())
+    let model = if args.len() == 3 {
+        scalar_string_from_array_named(&args[2], "model")?
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string())
     } else {
-        std::env::var(OPENAI_MODEL_ENV).unwrap_or_else(|_| DEFAULT_MODEL.to_string())
+        DEFAULT_MODEL.to_string()
     };
 
     let dimensions = model_dimensions(&model)?;
-    let config = EmbeddingConfig::from_env(&model)?;
+    let config = EmbeddingConfig::new(
+        Client::builder()
+            .timeout(std::time::Duration::from_millis(DEFAULT_TIMEOUT_MS))
+            .build()
+            .map_err(|err| {
+                generic_exec_err(
+                    Embedding::NAME,
+                    &format!("failed to build HTTP client: {err}"),
+                )
+            })?,
+        DEFAULT_BASE_URL.to_string(),
+        api_key,
+        model,
+        None,
+    );
 
     let values = text_values
         .iter()
@@ -183,13 +230,13 @@ fn scalar_value_to_string(value: &ScalarValue) -> Result<String> {
     }
 }
 
-fn scalar_string_from_array(array: &ArrayRef) -> Result<Option<String>> {
+fn scalar_string_from_array_named(array: &ArrayRef, argument_name: &str) -> Result<Option<String>> {
     match array.data_type() {
         DataType::Utf8 | DataType::Utf8View => {
             let values = collect_string_values(array)?;
             if values.len() != 1 {
                 return exec_err!(
-                    "Spark `embedding` function: model argument must be a scalar string literal"
+                    "Spark `embedding` function: {argument_name} argument must be a scalar string literal"
                 );
             }
             Ok(values.into_iter().next().flatten())
@@ -198,16 +245,27 @@ fn scalar_string_from_array(array: &ArrayRef) -> Result<Option<String>> {
             let values = collect_string_values(array)?;
             if values.len() != 1 {
                 return exec_err!(
-                    "Spark `embedding` function: model argument must be a scalar string literal"
+                    "Spark `embedding` function: {argument_name} argument must be a scalar string literal"
                 );
             }
             Ok(values.into_iter().next().flatten())
         }
         DataType::Null => Ok(None),
         other => {
-            exec_err!("Spark `embedding` function: model argument must be STRING, got {other:?}")
+            exec_err!(
+                "Spark `embedding` function: {argument_name} argument must be STRING, got {other:?}"
+            )
         }
     }
+}
+
+fn required_scalar_string_from_array(array: &ArrayRef, argument_name: &str) -> Result<String> {
+    scalar_string_from_array_named(array, argument_name)?.ok_or_else(|| {
+        generic_exec_err(
+            Embedding::NAME,
+            &format!("{argument_name} argument cannot be NULL"),
+        )
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -220,59 +278,20 @@ struct EmbeddingConfig {
 }
 
 impl EmbeddingConfig {
-    fn from_env(model: &str) -> Result<Self> {
-        let base_url =
-            std::env::var(OPENAI_BASE_URL_ENV).unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
-        let api_key = std::env::var(OPENAI_API_KEY_ENV).map_err(|_| {
-            generic_exec_err(
-                Embedding::NAME,
-                &format!("missing API key in environment variable `{OPENAI_API_KEY_ENV}`"),
-            )
-        })?;
-        let timeout_ms = std::env::var(OPENAI_TIMEOUT_MS_ENV)
-            .ok()
-            .map(|value| {
-                value.parse::<u64>().map_err(|_| {
-                    generic_exec_err(
-                        Embedding::NAME,
-                        &format!(
-                            "invalid timeout value `{value}` in environment variable `{OPENAI_TIMEOUT_MS_ENV}`"
-                        ),
-                    )
-                })
-            })
-            .transpose()?
-            .unwrap_or(DEFAULT_TIMEOUT_MS);
-        let dimensions = std::env::var(OPENAI_DIMENSIONS_ENV)
-            .ok()
-            .map(|value| {
-                value.parse::<i64>().map_err(|_| {
-                    generic_exec_err(
-                        Embedding::NAME,
-                        &format!(
-                            "invalid dimensions value `{value}` in environment variable `{OPENAI_DIMENSIONS_ENV}`"
-                        ),
-                    )
-                })
-            })
-            .transpose()?;
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_millis(timeout_ms))
-            .build()
-            .map_err(|err| {
-                generic_exec_err(
-                    Embedding::NAME,
-                    &format!("failed to build HTTP client: {err}"),
-                )
-            })?;
-
-        Ok(Self {
+    fn new(
+        client: Client,
+        base_url: String,
+        api_key: String,
+        model: String,
+        dimensions: Option<i64>,
+    ) -> Self {
+        Self {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
-            model: model.to_string(),
+            model,
             dimensions,
-        })
+        }
     }
 }
 
@@ -360,45 +379,10 @@ mod tests {
 
     use super::*;
 
-    struct EnvGuard {
-        vars: Vec<(&'static str, Option<String>)>,
-    }
-
-    impl EnvGuard {
-        fn set(values: &[(&'static str, &str)]) -> Self {
-            let vars = values
-                .iter()
-                .map(|(key, value)| {
-                    let prev = std::env::var(key).ok();
-                    std::env::set_var(key, value);
-                    (*key, prev)
-                })
-                .collect();
-            Self { vars }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in self.vars.drain(..) {
-                if let Some(value) = value {
-                    std::env::set_var(key, value);
-                } else {
-                    std::env::remove_var(key);
-                }
-            }
-        }
-    }
-
     #[test]
     fn test_embedding_request() {
         let runtime = Runtime::new().expect("runtime");
         let server = runtime.block_on(MockServer::start());
-        let _guard = EnvGuard::set(&[
-            (OPENAI_BASE_URL_ENV, &server.uri()),
-            (OPENAI_API_KEY_ENV, "secret"),
-            (OPENAI_TIMEOUT_MS_ENV, "1000"),
-        ]);
 
         runtime.block_on(async {
             Mock::given(method("POST"))
@@ -417,7 +401,16 @@ mod tests {
                 .await;
         });
 
-        let config = EmbeddingConfig::from_env(SMALL_MODEL).expect("config");
+        let config = EmbeddingConfig::new(
+            Client::builder()
+                .timeout(std::time::Duration::from_millis(1_000))
+                .build()
+                .expect("client"),
+            server.uri(),
+            "secret".to_string(),
+            SMALL_MODEL.to_string(),
+            None,
+        );
         let embedding = embed_text(&config, "hello world", SMALL_DIMENSIONS).expect("embedding");
         assert_eq!(embedding.len(), SMALL_DIMENSIONS as usize);
         assert_eq!(embedding[0], Some(0.5));
